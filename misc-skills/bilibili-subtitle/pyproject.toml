@@ -1,0 +1,26 @@
+[project]
+name = "bilibili-subtitle"
+version = "0.2.0"
+description = "Download Bilibili subtitles with BBDown and render transcripts."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bilibili_subtitle*"]
+exclude = ["plans*", "tests*"]
