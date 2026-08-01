@@ -70,6 +70,11 @@
 - **context7** — 库文档查询
 - **memory** — 知识图谱记忆
 - **sequential-thinking** — 深度思考
+- **playwright** — 浏览器自动化（2026-08-01 配置，重启会话后生效）
+
+> **Playwright 配置要点**：本机未装 Playwright 自带浏览器时，`@playwright/mcp` 启动会自动下载浏览器导致握手很慢/超时。解决：在配置的 `env` 中设置 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指向系统已装的 Chrome（如 `C:/Program Files/Google/Chrome/Application/chrome.exe`），即可跳过下载、秒级启动。
+>
+> **协议提示（2026-08 实测）**：新版 MCP SDK（≥1.30）的 stdio 协议已改为 **JSON Lines**（每条消息一行 JSON，`\n` 分隔），不再使用旧的 `Content-Length` 帧头。手动测试 MCP 服务器时注意此变化。
 
 ---
 
@@ -85,3 +90,4 @@
 | 日期 | 变更 |
 |------|------|
 | 2026-08-01 | 初始创建，收录官方全家桶 + 社区高频 MCP 推荐 |
+| 2026-08-01 | 本机配置 Playwright MCP（@playwright/mcp 0.0.78），用系统 Chrome 跳过浏览器下载 |
