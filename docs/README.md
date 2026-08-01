@@ -132,3 +132,4 @@
 | 2026-07-24 | 新增 wshobson/agents、anthropics/skills、自定义 Agent |
 | 2026-08-01 | 新增 obra/superpowers（14）、cexll/myclaude（11）、杂项（1）；anthropics/skills 扩充至 17 |
 | 2026-08-01 | 目录重组：所有技能来源收进 `skills/` 子库，新增 `mcp/` 子库 |
+| 2026-08-01 | MCP 排障：移除 time（官方包下架 404）与 fetch（npm 同名包为蜜罐），本机收敛为 4 个可用 MCP |

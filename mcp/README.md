@@ -70,11 +70,17 @@
 - **context7** — 库文档查询
 - **memory** — 知识图谱记忆
 - **sequential-thinking** — 深度思考
-- **playwright** — 浏览器自动化（2026-08-01 配置，重启会话后生效）
+- **playwright** — 浏览器自动化
 
 > **Playwright 配置要点**：本机未装 Playwright 自带浏览器时，`@playwright/mcp` 启动会自动下载浏览器导致握手很慢/超时。解决：在配置的 `env` 中设置 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指向系统已装的 Chrome（如 `C:/Program Files/Google/Chrome/Application/chrome.exe`），即可跳过下载、秒级启动。
 >
 > **协议提示（2026-08 实测）**：新版 MCP SDK（≥1.30）的 stdio 协议已改为 **JSON Lines**（每条消息一行 JSON，`\n` 分隔），不再使用旧的 `Content-Length` 帧头。手动测试 MCP 服务器时注意此变化。
+
+### 踩坑记录（2026-08-01 实测）
+
+- **`@modelcontextprotocol/server-time` 已从 npm 下架（404）**：官方 time 服务器不再发布 JS 包，照抄旧配置会连接失败。time 功能可由 Claude Code 自带的时间上下文替代，无需额外 MCP。
+- **npm 上的 `mcp-server-fetch` 是安全研究蜜罐（canary）包，切勿用于生产**：该包安装/执行时只向外发送最小遥测，不提供任何 MCP 功能——npx 包名混淆的典型案例。官方 fetch JS 版 `@modelcontextprotocol/server-fetch` 也已下架；仅 PyPI 官方版 `mcp-server-fetch` 可通过 `uvx` 使用（需安装 uv）。
+- 排查结论：本机 4 个 MCP（context7 / memory / sequential-thinking / playwright）全部可用。
 
 ---
 
@@ -91,3 +97,4 @@
 |------|------|
 | 2026-08-01 | 初始创建，收录官方全家桶 + 社区高频 MCP 推荐 |
 | 2026-08-01 | 本机配置 Playwright MCP（@playwright/mcp 0.0.78），用系统 Chrome 跳过浏览器下载 |
+| 2026-08-01 | 排障：移除 time（官方包 npm 404）与 fetch（npm 同名包为蜜罐），本机收敛为 4 个可用 MCP |
