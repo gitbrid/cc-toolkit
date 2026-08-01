@@ -122,6 +122,13 @@
 
 好用的 MCP 服务器推荐与收藏见 [mcp/README.md](../mcp/README.md)，涵盖官方全家桶、社区高频、按场景速查。
 
+### 本地 RAG（知识库检索，实战验证）✅
+
+**[rag-mcp + llama.cpp](./rag-mcp-介绍.md)** — 对本地 PDF/文档库做向量检索，数据不出本机。伴学项目（60+ 本教材书库）实战收录：
+- 工具：`index_document` / `search_docs` / `list_indexed_docs` / `delete_document`
+- embedding 后端：llama.cpp `llama-server` + bge-m3（1024 维多语言，中文好），端口 8080，OpenAI 兼容 `/v1/embeddings`
+- 存储：ChromaDB 持久化；中文教材扫描版需先 OCR；数学公式页读图而非 OCR
+
 ---
 
 ## 更新日志
@@ -133,3 +140,4 @@
 | 2026-08-01 | 新增 obra/superpowers（14）、cexll/myclaude（11）、杂项（1）；anthropics/skills 扩充至 17 |
 | 2026-08-01 | 目录重组：所有技能来源收进 `skills/` 子库，新增 `mcp/` 子库 |
 | 2026-08-01 | MCP 排障：移除 time（官方包下架 404）与 fetch（npm 同名包为蜜罐），本机收敛为 4 个可用 MCP |
+| 2026-08-01 | 新增本地 RAG：rag-mcp + llama.cpp + bge-m3（伴学项目实战收录），见 [rag-mcp-介绍.md](./rag-mcp-介绍.md) |

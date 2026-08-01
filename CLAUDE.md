@@ -67,6 +67,7 @@ CC 工具库/
 | 浏览器自动化操作 | cexll: `browser` |
 | 生成 PRD / 测试用例 | cexll: `product-requirements` → `test-cases` |
 | 提取 B站视频字幕 | misc: `bilibili-subtitle` |
+| 本地 PDF/文档库语义检索 | mcp/README 的「本地 RAG」→ [docs/rag-mcp-介绍.md](docs/rag-mcp-介绍.md) |
 | 从 GitHub 找好项目 | 本项目的 `github-discovery` 技能 |
 
 ## 如何给其他项目安装技能

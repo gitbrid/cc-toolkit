@@ -40,6 +40,7 @@
 | 网页内容抓取成文本 | Fetch |
 | 精确的语义搜索 | Tavily / Exa |
 | 深度分析复杂问题 | Sequential Thinking |
+| 对本地 PDF/文档库做语义检索 | rag-mcp + llama.cpp（见下方「本地 RAG」） |
 
 ## 四、如何在 Claude Code 中安装
 
@@ -84,6 +85,30 @@
 
 ---
 
+## 六、本地 RAG（知识库向量检索，数据不出本机）
+
+对本地 PDF / Markdown / 代码库做语义检索，适合**大量资料无法整本进上下文**的场景（如几十本教材的书库）。
+
+| 方案 | 说明 |
+|------|------|
+| **rag-mcp + llama.cpp**（实战验证 ✅） | 详细介绍见 [docs/rag-mcp-介绍.md](../docs/rag-mcp-介绍.md)。索引切块 → bge-m3 本地向量化 → ChromaDB 持久化 → `search_docs` 语义检索。用户偏好直接 llama.cpp（无 GUI），已改造客户端走 OpenAI 兼容 `/v1/embeddings` |
+| Rubrum95/rag-mcp-server | 强备选：自带多语言模型 + OCR + 页号引用，Python 3.10+，中文/扫描版场景可切换 |
+| eztakesin/doc-indexer-mcp | Rust + Qdrant + Voyage Key，重、默认需 Key，缓选 |
+
+**快速上手**：
+```bash
+pip install uv
+git clone --depth 1 https://github.com/Kamalesh-Kavin/rag-mcp D:/program/tools/rag-mcp
+cd D:/program/tools/rag-mcp && cp .env.example .env && uv sync
+# embedding 后端（llama.cpp，端口 8080）
+llama-server.exe -m bge-m3.gguf --embedding --pooling cls --host 127.0.0.1 --port 8080
+```
+项目 `.mcp.json` 中加 `rag` server（uv 用完整路径，env 里配 `OLLAMA_BASE_URL=http://127.0.0.1:8080`、`OLLAMA_EMBED_MODEL=bge-m3`、`CHROMA_PERSIST_DIR`）。
+
+> **要点**：① embedding 用 bge-m3（1024 维多语言，中文好）；② 中文教材常是扫描版需先 OCR；③ 数学公式靠 OCR 会乱码，公式页让 Claude 读图；④ llama.cpp 与 Ollama 的 bge-m3 向量一致（余弦=1.0），索引可通用。
+
+---
+
 ## 收藏新 MCP 的流程
 
 1. 找到目标 MCP 项目（GitHub 或官方文档）
@@ -98,3 +123,4 @@
 | 2026-08-01 | 初始创建，收录官方全家桶 + 社区高频 MCP 推荐 |
 | 2026-08-01 | 本机配置 Playwright MCP（@playwright/mcp 0.0.78），用系统 Chrome 跳过浏览器下载 |
 | 2026-08-01 | 排障：移除 time（官方包 npm 404）与 fetch（npm 同名包为蜜罐），本机收敛为 4 个可用 MCP |
+| 2026-08-01 | 新增「本地 RAG」：rag-mcp + llama.cpp + bge-m3 + ChromaDB（伴学项目实战收录），详见 docs/rag-mcp-介绍.md |
