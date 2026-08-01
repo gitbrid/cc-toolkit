@@ -1,7 +1,7 @@
 # obra/superpowers — 技能详细介绍
 
 > 来源：https://github.com/obra/superpowers  
-> 本地路径：`D:\program\CC 工具库\superpowers-skills\`  
+> 本地路径：`D:\program\CC 工具库\skills\superpowers-skills\`  
 > 导入自：cc-switch 远程安装（2026-08-01）
 
 ---

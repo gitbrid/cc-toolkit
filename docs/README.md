@@ -1,8 +1,8 @@
-# Skills 收集文档
+# Skills 与 MCP 收集文档
 
-本项目的 skills 集合，按来源分类。每个来源的详细介绍见下方子文档。
+本项目的 skills 与 MCP 集合。skills 按来源分类，每个来源的详细介绍见下方子文档；MCP 推荐清单见 [mcp/README.md](../mcp/README.md)。
 
-> **规则**：每次新增 skills 项目后，更新本文档和对应的详细介绍子文档。
+> **规则**：每次新增 skills / MCP 项目后，更新本文档和对应的详细介绍子文档。
 
 ---
 
@@ -30,7 +30,7 @@
 
 **一句话总结**：用 AI 镜像任何人的思维模式，让 Agent 以特定人物的风格和决策方式思考和回应。
 
-**本地路径**：`D:\program\CC 工具库\nuwa-skill\`
+**本地路径**：`D:\program\CC 工具库\skills\nuwa-skill\`
 
 ---
 
@@ -44,7 +44,7 @@
 
 **一句话总结**：为 Python 开发者提供技术深度的 Agent 技能，补足工作流技能在具体编码实践上的盲区。
 
-**本地路径**：`D:\program\CC 工具库\wshobson-skills\`
+**本地路径**：`D:\program\CC 工具库\skills\wshobson-skills\`
 
 ---
 
@@ -58,7 +58,7 @@
 
 **一句话总结**：官方维护的高质量通用技能，覆盖设计、文档、开发、测试全场景。
 
-**本地路径**：`D:\program\CC 工具库\anthropics-skills\`
+**本地路径**：`D:\program\CC 工具库\skills\anthropics-skills\`
 
 ---
 
@@ -72,7 +72,7 @@
 
 **一句话总结**：经过实战验证的中文 Agent 模板，可直接复用或按需定制。
 
-**本地路径**：`D:\program\CC 工具库\custom-agents\`
+**本地路径**：`D:\program\CC 工具库\skills\custom-agents\`
 
 ---
 
@@ -86,7 +86,7 @@
 
 **一句话总结**：把「没设计不写码、没验证不完成」固化为可强制执行的技能，与 mattpocock/skills 流程互补。
 
-**本地路径**：`D:\program\CC 工具库\superpowers-skills\`
+**本地路径**：`D:\program\CC 工具库\skills\superpowers-skills\`
 
 ---
 
@@ -100,7 +100,7 @@
 
 **一句话总结**：实用的自动化技能，部分依赖外部工具，按需选用。
 
-**本地路径**：`D:\program\CC 工具库\cexll-skills\`
+**本地路径**：`D:\program\CC 工具库\skills\cexll-skills\`
 
 ---
 
@@ -114,7 +114,13 @@
 
 **一句话总结**：B站字幕提取等杂项技能，按需启用。
 
-**本地路径**：`D:\program\CC 工具库\misc-skills\`
+**本地路径**：`D:\program\CC 工具库\skills\misc-skills\`
+
+---
+
+## MCP 收藏
+
+好用的 MCP 服务器推荐与收藏见 [mcp/README.md](../mcp/README.md)，涵盖官方全家桶、社区高频、按场景速查。
 
 ---
 
@@ -125,3 +131,4 @@
 | 2026-07-24 | 初始创建，收录 mattpocock/skills、alchaincyf/nuwa-skill |
 | 2026-07-24 | 新增 wshobson/agents、anthropics/skills、自定义 Agent |
 | 2026-08-01 | 新增 obra/superpowers（14）、cexll/myclaude（11）、杂项（1）；anthropics/skills 扩充至 17 |
+| 2026-08-01 | 目录重组：所有技能来源收进 `skills/` 子库，新增 `mcp/` 子库 |

@@ -1,7 +1,7 @@
 # cexll/myclaude — 技能详细介绍
 
 > 来源：https://github.com/cexll/myclaude  
-> 本地路径：`D:\program\CC 工具库\cexll-skills\`  
+> 本地路径：`D:\program\CC 工具库\skills\cexll-skills\`  
 > 导入自：cc-switch 远程安装（2026-08-01）
 
 ---

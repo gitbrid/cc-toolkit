@@ -1,7 +1,7 @@
 # anthropics/skills — 技能详细介绍
 
 > 来源：https://github.com/anthropics/skills  
-> 本地路径：`D:\program\CC 工具库\anthropics-skills\`  
+> 本地路径：`D:\program\CC 工具库\skills\anthropics-skills\`  
 > 提取自：`CC 3 for b站视频阅读器` 项目
 
 ---

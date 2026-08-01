@@ -2,7 +2,7 @@
 
 ## 项目定位
 
-这是我的**中央 Skills 仓库**，收集和整理各类 Claude Code / Agent Skills。其他项目不直接修改这里的文件，而是从这里**复制所需技能**到自己的 `.claude/skills/` 目录。
+这是我的**中央 Skills + MCP 仓库**，收集和整理各类 Claude Code / Agent Skills 和好用的 MCP 服务器。其他项目不直接修改这里的文件，而是从这里**复制所需技能 / MCP 配置**到自己的项目里。
 
 ## 目录结构
 
@@ -19,14 +19,17 @@ CC 工具库/
 │   ├── cexll-skills-介绍.md
 │   ├── misc-skills-介绍.md
 │   └── custom-agents-介绍.md
-├── skills/                      ← mattpocock/skills (41个技能)
-├── nuwa-skill/                  ← alchaincyf/nuwa-skill (15个思维视角)
-├── wshobson-skills/             ← wshobson/agents (4个Python深度技能)
-├── anthropics-skills/           ← anthropics/skills (17个通用技能)
-├── superpowers-skills/          ← obra/superpowers (14个工程工作流技能)
-├── cexll-skills/                ← cexll/myclaude (11个自动化技能)
-├── misc-skills/                 ← 杂项技能 (1个)
-└── custom-agents/               ← 自定义Agent (4个中文Agent)
+├── skills/                      ← 所有技能的来源子库
+│   ├── mattpocock-skills/       ← mattpocock/skills (41个技能)
+│   ├── nuwa-skill/              ← alchaincyf/nuwa-skill (15个思维视角)
+│   ├── wshobson-skills/         ← wshobson/agents (4个Python深度技能)
+│   ├── anthropics-skills/       ← anthropics/skills (17个通用技能)
+│   ├── superpowers-skills/      ← obra/superpowers (14个工程工作流技能)
+│   ├── cexll-skills/            ← cexll/myclaude (11个自动化技能)
+│   ├── misc-skills/             ← 杂项技能 (1个)
+│   └── custom-agents/           ← 自定义Agent (4个中文Agent)
+└── mcp/                         ← MCP 收藏子库
+    └── README.md                ← MCP 推荐清单与收藏索引
 ```
 
 ## 技能清单速览
@@ -72,7 +75,7 @@ CC 工具库/
 
 ```bash
 # 在新项目的 .claude/skills/ 下创建技能目录
-cp -r "D:/program/CC 工具库/wshobson-skills/python-testing-patterns" \
+cp -r "D:/program/CC 工具库/skills/wshobson-skills/python-testing-patterns" \
       "目标项目/.claude/skills/python-testing-patterns"
 ```
 
@@ -89,7 +92,7 @@ cp -r "D:/program/CC 工具库/wshobson-skills/python-testing-patterns" \
 - **日常开发工作流**：参考 mattpocock/skills（`/grill-with-docs`, `/to-spec`, `/implement` 等）
 - **Python 代码质量**：参考 wshobson/agents（`code-review-excellence`, `python-testing-patterns` 等）
 - **UI 设计**：参考 anthropics/skills 中的 `frontend-design`
-- **需要时从工具箱复制**：从 `D:\program\CC 工具库\$来源\技能名` 复制到 `.claude/skills/`
+- **需要时从工具箱复制**：从 `D:\program\CC 工具库\skills\$来源\技能名` 复制到 `.claude/skills/`
 
 当需要某个技能时，先去工具箱查看是否有合适的，然后复制到本项目使用。
 ```
@@ -107,7 +110,7 @@ cp -r "D:/program/CC 工具库/wshobson-skills/python-testing-patterns" \
 ### 手动添加流程
 
 1. 找到目标 GitHub 仓库
-2. 克隆到本工具库：`git clone --depth 1 <url> "D:/program/CC 工具库/<项目名>"`
+2. 克隆到本工具库：`git clone --depth 1 <url> "D:/program/CC 工具库/skills/<项目名>"`
 3. 阅读 README 了解技能内容
 4. 写介绍文档到 `docs/<项目名>-skills-介绍.md`
 5. 更新 `docs/README.md` 的索引
@@ -122,3 +125,14 @@ cp -r "D:/program/CC 工具库/wshobson-skills/python-testing-patterns" \
 - `wshobson/agents` — Python 代码质量（已收集）
 - `anthropics/skills` — 官方通用技能（已收集）
 - 更多待 `github-discovery` 发现...
+
+## MCP 收藏
+
+好用的 MCP 服务器推荐与收藏见 [mcp/README.md](mcp/README.md)。
+
+### 手动收藏流程
+
+1. 找到目标 MCP 项目（GitHub 或官方文档）
+2. 在 `mcp/` 下新建 `<项目名>/` 子目录，保存安装配置与要点
+3. 更新 `mcp/README.md` 的推荐清单
+4. 更新 `docs/README.md` 的索引

@@ -1,6 +1,6 @@
 # 自定义 Agent 介绍
 
-> 本地路径：`D:\program\CC 工具库\custom-agents\`  
+> 本地路径：`D:\program\CC 工具库\skills\custom-agents\`  
 > 提取自：`CC 3 for b站视频阅读器` 项目
 
 ---

@@ -1,7 +1,7 @@
 # 杂项技能 — 技能详细介绍
 
 > 来源：https://github.com/hamsterider-m/bilibili-subtitle  
-> 本地路径：`D:\program\CC 工具库\misc-skills\`  
+> 本地路径：`D:\program\CC 工具库\skills\misc-skills\`  
 > 导入自：cc-switch 远程安装（2026-08-01）
 
 ---

@@ -2,7 +2,7 @@
 
 > 来源：https://github.com/mattpocock/skills  
 > 安装：`npx skills@latest add mattpocock/skills`  
-> 本地路径：`D:\program\CC 工具库\skills\`
+> 本地路径：`D:\program\CC 工具库\skills\mattpocock-skills\`
 
 ---
 

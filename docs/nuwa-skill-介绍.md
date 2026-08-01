@@ -2,7 +2,7 @@
 
 > 来源：https://github.com/alchaincyf/nuwa-skill  
 > 安装：`npx skills add alchaincyf/nuwa-skill`  
-> 本地路径：`D:\program\CC 工具库\nuwa-skill\` ✅
+> 本地路径：`D:\program\CC 工具库\skills\nuwa-skill\` ✅
 
 ---
 

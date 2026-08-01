@@ -1,7 +1,7 @@
 # wshobson/agents — 技能详细介绍
 
 > 来源：https://github.com/wshobson/agents  
-> 本地路径：`D:\program\CC 工具库\wshobson-skills\`  
+> 本地路径：`D:\program\CC 工具库\skills\wshobson-skills\`  
 > 提取自：`CC 1 for study(论文)` 项目
 
 ---

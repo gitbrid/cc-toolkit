@@ -31,10 +31,10 @@
 
 ```bash
 # 示例：安装 python-testing-patterns
-cp -r "D:/program/CC 工具库/wshobson-skills/python-testing-patterns" \
+cp -r "D:/program/CC 工具库/skills/wshobson-skills/python-testing-patterns" \
       ".claude/skills/python-testing-patterns"
 ```
 
 ### 自定义 Agent
 
-工具箱中有 4 个经过实战验证的中文 Agent 模板，位于 `D:\program\CC 工具库\custom-agents\`。直接复制到本项目的 `.claude/agents/` 目录，并根据项目情况定制（把文件中的项目特定检查项换成自己的）。
+工具箱中有 4 个经过实战验证的中文 Agent 模板，位于 `D:\program\CC 工具库\skills\custom-agents\`。直接复制到本项目的 `.claude/agents/` 目录，并根据项目情况定制（把文件中的项目特定检查项换成自己的）。
