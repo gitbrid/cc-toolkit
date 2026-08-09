@@ -17,6 +17,9 @@ __pycache__/
 .env
 .env.local
 
+# Obsidian 本地配置
+/github-trending/.obsidian/
+
 # 便携工具二进制
 /tools/tesseract-portable/
 

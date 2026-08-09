@@ -6,7 +6,7 @@ import time
 
 from dates import week_ranges, month_label
 from github_api import search_new_repos, get_repo, get_readme_text
-from report import write_week_folder
+from report import write_week_folder, render_root_readme
 from snapshot import load_snapshot, save_snapshot, update_snapshot
 from trending_parser import fetch_trending
 
@@ -43,9 +43,19 @@ def _month_bounds(d):
     return ms, me
 
 
+def refresh_root_readme(output_root):
+    folders = sorted(
+        name for name in os.listdir(output_root)
+        if os.path.isdir(os.path.join(output_root, name)) and not name.startswith(".")
+    )
+    with open(os.path.join(output_root, "README.md"), "w", encoding="utf-8") as f:
+        f.write(render_root_readme(folders))
+
+
 def run_backfill(start, end, top, max_count, token, output_root, data_dir, with_readme=False):
     total = 0
     month_cache = {}
+    os.makedirs(output_root, exist_ok=True)
     for ws, we in week_ranges(start, end):
         try:
             weekly = {"new_star": _collect_new(ws, we, top, max_count, token, with_readme)}
@@ -58,6 +68,7 @@ def run_backfill(start, end, top, max_count, token, output_root, data_dir, with_
             time.sleep(7)
         except Exception as e:
             _log_failure(data_dir, f"backfill week {ws}..{we}: {e}")
+    refresh_root_readme(output_root)
     return total
 
 
@@ -92,6 +103,7 @@ def run_week(week_start, top, max_count, token, output_root, data_dir, with_read
     ms, me = _month_bounds(ws)
     monthly = _collect_new(ms, me, top, max_count, token, with_readme)
     write_week_folder(output_root, ws, we, weekly, monthly)
+    refresh_root_readme(output_root)
     return 1
 
 
@@ -104,6 +116,7 @@ def run_month(month, top, max_count, token, output_root, data_dir, with_readme=F
         if ws.month != m:
             continue
         write_week_folder(output_root, ws, we, {"new_star": []}, projects)
+    refresh_root_readme(output_root)
     return len(projects)
 
 

@@ -37,6 +37,16 @@ def render_index(week_label, files):
     return f"# {week_label} GitHub 热点\n\n## 榜单文件\n\n{links}\n"
 
 
+def render_root_readme(folders):
+    links = "\n".join(f"- [[{folder}|{folder}]]" for folder in folders)
+    return (
+        "# GitHub 每周热点\n\n"
+        "用 Obsidian 打开本文件夹即可浏览。每周目录按 `YYYY MM.DD-MM.DD` 命名。\n\n"
+        "## 周归档\n\n"
+        f"{links}\n"
+    )
+
+
 def write_week_folder(output_root, start, end, weekly, monthly):
     folder = os.path.join(output_root, week_folder(start, end))
     os.makedirs(folder, exist_ok=True)
