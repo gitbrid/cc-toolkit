@@ -5,16 +5,32 @@ from dates import week_folder, month_label
 from recommend import recommend
 
 
+def _project_name(p):
+    return p.get("name") or p.get("full_name") or "未知"
+
+
+def _project_url(p):
+    if p.get("html_url"):
+        return p["html_url"]
+    if p.get("full_name"):
+        return f"https://github.com/{p['full_name']}"
+    return ""
+
+
 def render_project_block(p):
     topics = ", ".join(p.get("topics", [])) or "无"
     stars = p.get("stargazers_count", p.get("stars", 0))
-    delta = p.get("delta")
-    delta_text = f"（本周 +{delta}）" if delta else ""
+    if p.get("delta"):
+        stars_text = f"{stars}（本周 +{p['delta']}）"
+    elif p.get("stars_today"):
+        stars_text = f"周期内 +{p['stars_today']}"
+    else:
+        stars_text = str(stars)
     return (
-        f"### {p.get('name')}\n\n"
-        f"- 链接：<{p.get('html_url', '')}>\n"
+        f"### {_project_name(p)}\n\n"
+        f"- 链接：<{_project_url(p)}>\n"
         f"- 语言：{p.get('language') or '未标注'}\n"
-        f"- Stars：{stars}{delta_text}\n"
+        f"- Stars：{stars_text}\n"
         f"- 创建时间：{p.get('created_at', '未知')}\n"
         f"- Topics：{topics}\n\n"
         f"**项目介绍**\n\n{p.get('description') or '暂无简介'}\n\n"
@@ -26,7 +42,7 @@ def render_project_block(p):
 def render_ranking(title, projects):
     lines = [f"# {title}", "", f"共 {len(projects)} 个项目", ""]
     for i, p in enumerate(projects, 1):
-        lines.append(f"## Top {i}：{p.get('name')}")
+        lines.append(f"## Top {i}：{_project_name(p)}")
         lines.append("")
         lines.append(render_project_block(p))
     return "\n".join(lines) + "\n"

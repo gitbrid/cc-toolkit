@@ -32,6 +32,7 @@ class _TrendingParser(HTMLParser):
         self.in_h2 = False
         self.in_desc = False
         self.in_lang = False
+        self.in_stars = False
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -43,6 +44,8 @@ class _TrendingParser(HTMLParser):
             self.in_desc = True
         elif tag == "span" and attrs.get("itemprop") == "programmingLanguage":
             self.in_lang = True
+        elif tag == "span" and "float-sm-right" in attrs.get("class", ""):
+            self.in_stars = True
 
     def handle_endtag(self, tag):
         if tag == "article" and self.current is not None:
@@ -54,6 +57,7 @@ class _TrendingParser(HTMLParser):
             self.in_desc = False
         elif tag == "span":
             self.in_lang = False
+            self.in_stars = False
 
     def handle_data(self, data):
         if self.current is None:
@@ -67,8 +71,8 @@ class _TrendingParser(HTMLParser):
             self.current["description"] += text
         elif self.in_lang:
             self.current["language"] += text
-        elif "stars today" in text:
-            self.current["stars_today_text"] = text
+        elif self.in_stars:
+            self.current["stars_today_text"] += text
 
 
 def fetch_trending(since="weekly", token=None):
@@ -77,8 +81,10 @@ def fetch_trending(since="weekly", token=None):
     parser = _TrendingParser()
     parser.feed(html)
     for row in parser.rows:
-        m = re.search(r"([\d,]+)\s+stars today", row["stars_today_text"])
+        row["full_name"] = re.sub(r"\s+", "", row["full_name"])
+        m = re.search(r"([\d,]+)\s+stars this (?:week|month)", row["stars_today_text"])
         row["stars_today"] = int(m.group(1).replace(",", "")) if m else 0
         row["description"] = row["description"].strip()
-        row["full_name"] = row["full_name"].strip()
+        row["name"] = row["full_name"].split("/", 1)[-1]
+        row["html_url"] = f"https://github.com/{row['full_name']}"
     return parser.rows

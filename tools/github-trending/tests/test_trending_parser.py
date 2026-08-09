@@ -13,6 +13,8 @@ class TestTrendingParser(unittest.TestCase):
             rows = fetch_trending()
         self.assertEqual(rows[0]["full_name"], "owner/repo-a")
         self.assertEqual(rows[0]["stars_today"], 123)
+        self.assertEqual(rows[0]["name"], "repo-a")
+        self.assertEqual(rows[0]["html_url"], "https://github.com/owner/repo-a")
         self.assertEqual(rows[1]["full_name"], "owner/repo-b")
         self.assertEqual(rows[1]["language"], "TypeScript")
 

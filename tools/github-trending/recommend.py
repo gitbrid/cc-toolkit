@@ -12,8 +12,16 @@ def recommend(project):
         reasons.append("与 Obsidian/笔记/知识管理相关，可直接借鉴或集成")
     if any(k in text for k in ("mcp", "model context protocol")):
         reasons.append("MCP 生态项目，可对照你的 MCP 收藏库评估")
+    if any(k in text for k in ("pdf", "docx", "word", "excel", "spreadsheet", "ocr", "document")):
+        reasons.append("文档/办公处理方向，和你的 PDF、Word、Excel 工具链相关")
     if any(k in text for k in ("automation", "workflow", "cli", "crawler", "scrape")):
         reasons.append("偏自动化和工程效率，适合补进工具库场景")
+    if any(k in text for k in ("security", "reverse engineering", "penetration", "pentest", "hack")):
+        reasons.append("安全研究向项目，适合评估是否纳入你的安全技能库")
+    if any(k in text for k in ("browser", "chrome", "playwright", "selenium")):
+        reasons.append("浏览器自动化方向，可对照你的浏览器自动化技能使用")
+    if any(k in text for k in ("database", "sql", "vector", "embedding", "retrieval")):
+        reasons.append("数据/检索方向，可对照你的本地 RAG 知识库评估")
     if not reasons:
         reasons.append("值得关注的新项目，建议按文档判断是否适合你的工作流")
     return "；".join(reasons) + "。"
