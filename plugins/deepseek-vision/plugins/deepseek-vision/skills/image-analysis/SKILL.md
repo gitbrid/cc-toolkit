@@ -32,6 +32,19 @@ DeepSeek 等文本模型没有原生视觉能力，**不能直接接收图片**�
 2. 用返回的本地路径作为 `image` 参数，继续走下面的工具选择流程；
 3. 如果剪贴板里没有图片，提示用户先按 Win+Shift+S 截图或复制一张图片，再重新发起请求。
 
+
+## 本地 OCR 兜底（未配置视觉 API 时）
+
+DeepSeek 官方 API 不支持图片输入。如果视觉服务尚未配置，或用户只需要把图片 / 扫描 PDF 变成文字，直接用本地 Tesseract 兜底，不要等待视觉 API：
+
+```powershell
+uv tool run --python 3.12 --with pypdfium2 --with pillow python "D:\program\CC 工具库\plugins\deepseek-vision\plugins\deepseek-vision\scripts\local_ocr.py" "<图片或PDF路径>" --out "<输出目录>"
+```
+
+- 图片（PNG / JPG 等）直接识别；PDF 自动逐页渲染后识别，可加 `--start 1 --end 20` 限制页码，`--lang chi_sim+eng` 切换语言。
+- 优点：免费、本地、免管理员，适合书页、截图、扫描件。
+- 缺点：复杂图表、水印遮挡、手写体的识别弱于多模态模型；这类需求再配置视觉 API（MCP_OCR_BASE_URL / MCP_OCR_API_KEY / MCP_OCR_MODEL）后使用 `analyze_image` / `ocr_extract`。
+- 便携 Tesseract 已部署在 `D:\program\CC 工具库\tools\tesseract-portable`（含 chi_sim / eng / osd）。
 ## 工具选择
 
 | 场景 | 工具 | 说明 |

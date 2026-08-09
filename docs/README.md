@@ -144,6 +144,10 @@
 - [the-learning-skill](./the-learning-skill-介绍.md)：学习教练 Agent Skill，已复制到伴学项目
 - [obsidian-deepseek-note-helper](./obsidian-deepseek-note-helper-介绍.md)：Obsidian 侧边栏 DeepSeek 助手插件
 
+### 本地 OCR（便携 Tesseract）✅
+
+**[tesseract-portable-介绍](./tesseract-portable-介绍.md)** — 免管理员便携 Tesseract（chi_sim/eng/osd），为 pdf-mcp 和 deepseek-vision 提供本地 OCR 兜底；DeepSeek 官方 API 不支持图片，图片/扫描 PDF 默认走本地识别。
+
 ---
 
 ## 更新日志
@@ -158,3 +162,4 @@
 | 2026-08-01 | 新增本地 RAG：rag-mcp + llama.cpp + bge-m3（伴学项目实战收录），见 [rag-mcp-介绍.md](./rag-mcp-介绍.md) |
 | 2026-08-09 | 新增 DeepSeek 工具集：DeepSeekHelper、DeepSeek MCP Server、DeepSeek Vision，见 [deepseek-tools-介绍.md](./deepseek-tools-介绍.md) |
 | 2026-08-09 | 第二批：rag-mcp-server、pdf-mcp、the-learning-skill、obsidian-deepseek-note-helper 收录 |
+| 2026-08-09 | 本地 OCR：便携 Tesseract（chi_sim/eng/osd）+ deepseek-vision 本地兜底，更新全部 DeepSeek key |

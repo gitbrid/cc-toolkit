@@ -60,5 +60,5 @@ args = ["tool", "run", "pdf-mcp"]
 ## 注意
 
 - 首次运行会下载 fastembed 语义模型（约 67MB）与 Python 依赖
-- OCR 需要系统安装 Tesseract，Windows 可从 UB-Mannheim 下载安装包
+- OCR 使用免管理员便携 Tesseract：`D:\program\CC 工具库\tools\tesseract-portable`（含 chi_sim/eng/osd），已写入用户 PATH 与 TESSDATA_PREFIX，Codex 的 `[mcp_servers.pdf-mcp.env]` 也已配置；重启 Codex 后生效
 - Intel macOS Python 3.14+ 无 onnxruntime wheel，需用 Python <= 3.13

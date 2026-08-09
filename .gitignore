@@ -16,3 +16,13 @@ __pycache__/
 # 本地环境
 .env
 .env.local
+
+# 便携工具二进制
+/tools/tesseract-portable/
+
+# pdf-mcp runtime data
+/mcp/pdf-mcp/benchmark_data/
+/mcp/pdf-mcp/pages/
+
+# the-learning-skill workspace
+/skills/the-learning-skill/the-learning-skill-workspace/

@@ -7,6 +7,16 @@ description: 把扫描版 PDF（纯图片页、带斜体水印）批量转成文
 
 针对“拍照扫描的书籍 PDF + 斜体水印遮挡部分文字”场景的批量转换工作流。
 
+
+## 无视觉 API 时的本地草稿模式
+
+若还没有可用的视觉 API，先用本地 Tesseract 出全文本草稿（免费、免管理员）：
+
+```powershell
+uv tool run --python 3.12 --with pypdfium2 --with pillow python "D:\program\CC 工具库\plugins\deepseek-vision\plugins\deepseek-vision\scripts\local_ocr.py" "<扫描PDF>" --out "<OCR目录>" --lang chi_sim+eng
+```
+
+识别质量足以先定位章节和内容；对水印、密排页、音标等仍建议后续配置视觉模型后用 `scripts\batch_ocr.py` 精修。
 ## 适用场景
 
 - PDF 没有文字层（整页都是图片），需要提取正文

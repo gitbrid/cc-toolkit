@@ -22,14 +22,14 @@
 - 配置：`mcp/deepseek-mcp-server/.env`（已写入 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`），gitignore 排除
 - 用途：让支持 MCP 的客户端直接调用 DeepSeek，后续可复制同一套配置给 Cursor / Claude Code
 
-### 3. DeepSeek Vision（Codex 插件，已安装，待配视觉 API）
+### 3. DeepSeek Vision（Codex 插件，本地 OCR 已就绪）
 
 - 仓库：`wssfk12138/deepseek-vision`，版本 1.3.2
 - 本地源码：`D:\program\CC 工具库\plugins\deepseek-vision`
 - 市场：`cc-toolbox`，Codex 插件 ID：`deepseek-vision@cc-toolbox`
 - 能力：图片分析、OCR、扫描 PDF 转 DOCX、表格提取、国际音标核对、DOCX 渲染质检
-- 配置：插件根目录 `.env` 已生成模板，需要用户填写 `MCP_OCR_BASE_URL`、`MCP_OCR_API_KEY`、`MCP_OCR_MODEL`；依赖 `uv`（已安装到 bundled Python Scripts）
-- 用途：给纯文本 DeepSeek 补“眼睛”，服务伴学拍照答疑、资料整理 OCR、论文扫描件处理
+- 配置：插件根目录 `.env` 已写入说明；DeepSeek 官方不支持图片，默认用 `scripts/local_ocr.py` 本地 OCR 兜底（便携 Tesseract）；如需多模态模型级识别，再填 `MCP_OCR_BASE_URL` / `MCP_OCR_API_KEY` / `MCP_OCR_MODEL`；依赖 `uv`（已安装到 bundled Python Scripts）
+- 用途：给纯文本 DeepSeek 补“眼睛”，服务伴学拍照答疑、资料整理 OCR、论文扫描件处理；本地 OCR 兜底已部署（Tesseract 便携版）
 
 ## 部署映射
 
