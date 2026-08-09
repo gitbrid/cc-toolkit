@@ -22,3 +22,8 @@
 - 18 个 unittest 全部通过。
 - 历史补录 32 周（2026-01-01 至 2026-08-09）无失败日志。
 - 当前周 2026 08.03-08.09 已生成三榜 + 月榜并真实抓取验证。
+
+## 自动化
+
+- 2026-08-09 已创建 Windows 计划任务 `CC-Toolkit-GitHubTrendingWeekly`：每周一 09:00 运行 `tools/github-trending/run-weekly.bat`，当前用户交互式登录。
+- 当前 Codex 会话没有 automation 工具，Codex 应用内每周任务暂未创建；如后续可用再替换为 Codex 自动化并润色介绍。

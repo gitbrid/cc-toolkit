@@ -54,7 +54,7 @@ $PY = "C:\Users\subrid\.cache\codex-runtimes\codex-primary-runtime\dependencies\
 - Codex 应用内创建每周自动任务：每周一 09:00 运行 `D:\program\CC 工具库\tools\github-trending\run-weekly.bat`。
 - Windows 任务计划程序：新建每周任务，操作指向 `run-weekly.bat`，时间为每周一 09:00。
 
-每周任务生成后，可用 Codex 对 `raw-data.json` 润色项目介绍与「你可能用到」推荐，再提交归档。
+2026-08-09 已创建 Windows 计划任务：`CC-Toolkit-GitHubTrendingWeekly`，每周一 09:00 自动运行，当前用户交互式登录。任务创建后生成的 `raw-data.json` 可由 Codex 按需润色介绍与推荐，再提交归档。
 
 ## 脚本结构
 
