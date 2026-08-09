@@ -1,0 +1,32 @@
+{
+  "name": "cc-toolbox",
+  "interface": {
+    "displayName": "CC 工具库"
+  },
+  "plugins": [
+    {
+      "name": "deepseekhelper",
+      "source": {
+        "source": "local",
+        "path": "./plugins/deepseekhelper"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "deepseek-vision",
+      "source": {
+        "source": "local",
+        "path": "./plugins/deepseek-vision/plugins/deepseek-vision"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

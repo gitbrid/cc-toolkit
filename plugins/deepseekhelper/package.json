@@ -1,0 +1,33 @@
+{
+  "name": "deepseekhelper",
+  "version": "0.3.4",
+  "private": true,
+  "type": "module",
+  "description": "Codex plugin MCP server for DeepSeek supervised collaboration.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/UrgencyWu/deepseekhelper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/UrgencyWu/deepseekhelper/issues"
+  },
+  "homepage": "https://github.com/UrgencyWu/deepseekhelper#readme",
+  "keywords": [
+    "codex",
+    "codex-plugin",
+    "deepseek",
+    "mcp",
+    "mcp-server",
+    "claude-code",
+    "ai",
+    "llm"
+  ],
+  "scripts": {
+    "start": "node scripts/server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "openai": "^4.104.0",
+    "zod": "^3.25.76"
+  }
+}

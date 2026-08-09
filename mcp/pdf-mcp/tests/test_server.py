@@ -1,0 +1,4791 @@
+# tests/test_server.py
+"""Tests for MCP server tools."""
+
+import base64
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pymupdf
+import pytest
+
+from unittest.mock import patch, Mock
+
+import httpx
+
+import pdf_mcp.server as server
+from pdf_mcp.server import (
+    _resolve_path,
+    _python_search,
+    _rrf_fuse,
+    pdf_info,
+    pdf_read_pages,
+    pdf_read_all,
+    pdf_search,
+    pdf_get_toc,
+    pdf_corpus_warm,
+    pdf_corpus_overview,
+    pdf_corpus_search,
+    pdf_cache_stats,
+    pdf_cache_clear,
+    pdf_render_pages,
+)
+from pdf_mcp.url_fetcher import URLFetcher
+from pdf_mcp.parallel import PageError
+
+
+class TestURLDownloadCacheWiring:
+    """The server wires URL downloads under the main cache root."""
+
+    def test_url_downloads_live_under_cache_root(self):
+        """url_fetcher.cache_dir is cache.cache_dir/downloads, so it tracks
+        PDF_MCP_CACHE_DIR like every other cache artifact (issue #15)."""
+        import pdf_mcp.server as server_module
+
+        assert (
+            server_module.url_fetcher.cache_dir
+            == server_module.cache.cache_dir / "downloads"
+        )
+
+
+class TestRrfFuse:
+    """Unit tests for _rrf_fuse() — pure RRF math, no PDF required."""
+
+    def test_scores_both_lists(self):
+        """Page in both lists accumulates both RRF terms."""
+        # page 5: kw_rank=1 → 1/61; sem_rank=2 → 1/62
+        # page 10: kw_rank=2 → 1/62; sem_rank=1 → 1/61
+        # Both equal → tie broken by ascending page: [5, 10]
+        result = _rrf_fuse([5, 10], [10, 5], max_results=10)
+        scores = dict(result)
+        assert abs(scores[5] - (1 / 61 + 1 / 62)) < 1e-6
+        assert abs(scores[10] - (1 / 62 + 1 / 61)) < 1e-6
+        pages = [p for p, _ in result]
+        assert pages == [5, 10]  # tie broken by ascending page
+
+    def test_keyword_only_page(self):
+        """Page in keyword list only gets 1/(60+rank), semantic term = 0."""
+        result = _rrf_fuse([3], [], max_results=10)
+        assert len(result) == 1
+        page, score = result[0]
+        assert page == 3
+        assert abs(score - 1 / 61) < 1e-6
+
+    def test_semantic_only_page(self):
+        """Page in semantic list only gets 1/(60+rank), keyword term = 0."""
+        result = _rrf_fuse([], [7], max_results=10)
+        assert len(result) == 1
+        page, score = result[0]
+        assert page == 7
+        assert abs(score - 1 / 61) < 1e-6
+
+    def test_tie_breaking_ascending_page(self):
+        """Equal RRF scores (both rank 1 in different lists) → ascending page wins."""
+        result = _rrf_fuse([20], [5], max_results=10)
+        pages = [p for p, _ in result]
+        assert pages == [5, 20]
+
+    def test_max_results_honored(self):
+        """Result truncated to max_results even with many candidates."""
+        result = _rrf_fuse(list(range(20)), list(range(20, 40)), max_results=5)
+        assert len(result) == 5
+
+    def test_sorted_descending_score(self):
+        """Pages that appear in both lists rank above pages in only one."""
+        # Pages 1,2,3 appear in both lists — higher RRF score
+        # Pages 4,5,6 appear only in keyword list — lower RRF score
+        result = _rrf_fuse([1, 2, 3, 4, 5, 6], [1, 2, 3], max_results=10)
+        scores = [s for _, s in result]
+        assert scores == sorted(scores, reverse=True)
+        # First 3 results should be pages 1, 2, 3
+        top_pages = [p for p, _ in result[:3]]
+        assert set(top_pages) == {1, 2, 3}
+
+
+class TestPdfSearchModes:
+    """Tests for pdf_search mode parameter routing."""
+
+    # ── helpers ─────────────────────────────────────────────────────────
+
+    def _make_encode(self, dim: int = 384):
+        """
+        Return (encode, encode_query) mocks with deterministic vectors.
+        Page i gets a unit vector at dimension (i % dim).
+        Query gets a unit vector at dimension 0 → page 0 scores highest.
+        """
+
+        def encode(texts, model_name="BAAI/bge-small-en-v1.5"):
+            result = np.zeros((len(texts), dim), dtype=np.float32)
+            for i in range(len(texts)):
+                result[i, i % dim] = 1.0
+            return result
+
+        def encode_query(text, model_name="BAAI/bge-small-en-v1.5"):
+            v = np.zeros(dim, dtype=np.float32)
+            v[0] = 1.0
+            return v
+
+        return encode, encode_query
+
+    # ── mode validation ──────────────────────────────────────────────────
+
+    def test_invalid_mode_returns_error(self, sample_pdf, isolated_server):
+        """Unknown mode string returns error dict before opening the PDF."""
+        result = pdf_search(sample_pdf, "page", mode="fuzzy")
+
+        assert "error" in result
+        assert "fuzzy" in result["error"]
+        assert "auto" in result["error"]
+        assert "keyword" in result["error"]
+        assert "semantic" in result["error"]
+
+    def test_invalid_mode_includes_query(self, sample_pdf, isolated_server):
+        """Error response includes the original query for context."""
+        result = pdf_search(sample_pdf, "hello", mode="bad")
+        assert result.get("query") == "hello"
+
+    # ── mode="keyword" ───────────────────────────────────────────────────
+
+    def test_keyword_mode_returns_search_mode_keyword(
+        self, sample_pdf, isolated_server
+    ):
+        """mode='keyword' always returns search_mode='keyword'."""
+        result = pdf_search(sample_pdf, "page", mode="keyword")
+
+        assert result.get("search_mode") == "keyword"
+
+    def test_keyword_mode_has_total_matches(self, sample_pdf, isolated_server):
+        """mode='keyword' response includes total_matches and page_match_counts."""
+        result = pdf_search(sample_pdf, "page", mode="keyword")
+
+        assert "total_matches" in result
+        assert "page_match_counts" in result
+
+    def test_keyword_mode_ignores_fastembed(self, sample_pdf, isolated_server):
+        """mode='keyword' never calls embedder even when fastembed is installed."""
+        with patch("pdf_mcp.embedder.encode") as mock_encode:
+            pdf_search(sample_pdf, "page", mode="keyword")
+            mock_encode.assert_not_called()
+
+    # ── mode="semantic", no fastembed ────────────────────────────────────
+
+    def test_semantic_mode_no_fastembed_returns_error(
+        self, sample_pdf, isolated_server
+    ):
+        """mode='semantic' without fastembed returns error + install_hint."""
+        with patch(
+            "pdf_mcp.embedder.check_available",
+            side_effect=ImportError("fastembed not installed"),
+        ):
+            result = pdf_search(sample_pdf, "query", mode="semantic")
+
+        assert "error" in result
+        assert "install_hint" in result
+
+    def test_semantic_mode_no_fastembed_check_before_path(
+        self, isolated_server, tmp_path
+    ):
+        """mode='semantic' fastembed check happens before path resolution."""
+        with patch(
+            "pdf_mcp.embedder.check_available",
+            side_effect=ImportError("fastembed not installed"),
+        ):
+            # Non-existent path — should still return error, not FileNotFoundError
+            result = pdf_search("/nonexistent/file.pdf", "query", mode="semantic")
+
+        assert "error" in result
+        assert "install_hint" in result
+
+    # ── mode="semantic", fastembed available ─────────────────────────────
+
+    def test_semantic_mode_returns_search_mode_semantic(
+        self, sample_pdf, isolated_server
+    ):
+        """mode='semantic' with fastembed returns search_mode='semantic'."""
+        encode, encode_query = self._make_encode()
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(sample_pdf, "test", mode="semantic")
+
+        assert result.get("search_mode") == "semantic"
+
+    def test_semantic_mode_includes_count_fields(self, sample_pdf, isolated_server):
+        """mode='semantic' response includes total_matches matching len(matches)."""
+        encode, encode_query = self._make_encode()
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(sample_pdf, "test", mode="semantic")
+
+        assert "total_matches" in result
+        assert "page_match_counts" in result
+        assert result["total_matches"] == len(result["matches"])
+
+    def test_semantic_mode_low_confidence_flagged_when_score_below_threshold(
+        self, sample_pdf, isolated_server
+    ):
+        """Each semantic match carries low_confidence; response carries the
+        threshold and a roll-up flag. With a deterministic encode that yields
+        cosine ~0 we expect all_results_low_confidence=True."""
+        encode, encode_query = self._make_encode()
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(sample_pdf, "unrelated", mode="semantic")
+
+        assert "confidence_threshold" in result
+        assert "all_results_low_confidence" in result
+        for m in result["matches"]:
+            assert "low_confidence" in m
+            assert isinstance(m["low_confidence"], bool)
+            assert m["low_confidence"] is (m["score"] < result["confidence_threshold"])
+
+    def test_hybrid_mode_low_confidence_flag(self, sample_pdf, isolated_server):
+        """Hybrid match without keyword hit and with semantic cosine below
+        the threshold is flagged low_confidence; pages with keyword hits
+        are not flagged (literal terms appear)."""
+        encode, encode_query = self._make_encode()
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            # "page" appears literally in the corpus → keyword hits → confident
+            kw_result = pdf_search(sample_pdf, "page", mode="auto")
+            # Unrelated query → no keyword hits and tiny cosine scores
+            none_result = pdf_search(sample_pdf, "unrelated", mode="auto")
+
+        for m in kw_result["matches"]:
+            assert "low_confidence" in m
+            assert "semantic_score" in m
+        # The "unrelated" query should have at least one low-confidence match
+        # and the top-level rollup should reflect that
+        assert "all_results_low_confidence" in none_result
+        assert any(m["low_confidence"] for m in none_result["matches"])
+        # Returned, not dropped — agent decides what to do
+        assert len(none_result["matches"]) > 0
+
+    def test_semantic_mode_matches_shape(self, sample_pdf, isolated_server):
+        """mode='semantic' matches have page, excerpt, score, position."""
+        encode, encode_query = self._make_encode()
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(sample_pdf, "test", mode="semantic")
+
+        assert "matches" in result
+        assert len(result["matches"]) > 0
+        for m in result["matches"]:
+            assert "page" in m
+            assert "excerpt" in m
+            assert "score" in m
+            assert "position" in m
+            assert m["position"] == 0
+
+    def test_semantic_mode_excerpt_uses_context_chars(
+        self, sample_pdf, isolated_server
+    ):
+        """mode='semantic' excerpt is first context_chars chars of page text."""
+        encode, encode_query = self._make_encode()
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result_50 = pdf_search(
+                sample_pdf, "test", mode="semantic", context_chars=50
+            )
+            result_200 = pdf_search(
+                sample_pdf, "test", mode="semantic", context_chars=200
+            )
+
+        # Shorter context produces shorter excerpts
+        lens_50 = [len(m["excerpt"]) for m in result_50["matches"]]
+        lens_200 = [len(m["excerpt"]) for m in result_200["matches"]]
+        assert max(lens_50) <= max(lens_200)
+
+    # ── mode="auto" hybrid ───────────────────────────────────────────────
+
+    def test_auto_mode_no_fastembed_returns_keyword(self, sample_pdf, isolated_server):
+        """mode='auto' without fastembed falls back to search_mode='keyword'."""
+        with patch(
+            "pdf_mcp.embedder.check_available",
+            side_effect=ImportError("fastembed not installed"),
+        ):
+            result = pdf_search(sample_pdf, "page", mode="auto")
+
+        assert result.get("search_mode") == "keyword"
+        assert "total_matches" in result
+        assert "page_match_counts" in result
+
+    def test_auto_mode_falls_back_on_encode_failure(self, sample_pdf, isolated_server):
+        """mode='auto' degrades to keyword when embedder.encode() raises
+        (model load failure, network outage, etc.)."""
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch(
+                "pdf_mcp.embedder.encode",
+                side_effect=ValueError("Could not load model BAAI/bge-small-en-v1.5"),
+            ),
+        ):
+            result = pdf_search(sample_pdf, "page", mode="auto")
+
+        assert result.get("search_mode") == "keyword"
+        assert result.get("semantic_unavailable") is True
+        assert "semantic_unavailable_reason" in result
+        assert "Could not load model" in result["semantic_unavailable_reason"]
+
+    def test_auto_mode_falls_back_on_encode_query_failure(
+        self, sample_pdf, isolated_server
+    ):
+        """mode='auto' degrades to keyword when encode_query() raises after
+        page embeddings are already cached."""
+        encode, _ = self._make_encode()
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch(
+                "pdf_mcp.embedder.encode_query",
+                side_effect=ValueError("Could not load model"),
+            ),
+        ):
+            result = pdf_search(sample_pdf, "page", mode="auto")
+
+        assert result.get("search_mode") == "keyword"
+        assert result.get("semantic_unavailable") is True
+
+    def test_auto_mode_no_fastembed_sets_unavailable_flag(
+        self, sample_pdf, isolated_server
+    ):
+        """ImportError fallback (fastembed missing) sets semantic_unavailable
+        with an actionable install hint, matching pdf_corpus_search. Silent
+        keyword degradation hid that the default install runs without the
+        semantic arm every benchmark validates."""
+        with patch(
+            "pdf_mcp.embedder.check_available",
+            side_effect=ImportError(
+                "pdf_search semantic mode requires the 'fastembed' package. "
+                "It ships with the default install; restore it with: "
+                "pip install fastembed"
+            ),
+        ):
+            result = pdf_search(sample_pdf, "page", mode="auto")
+
+        assert result.get("search_mode") == "keyword"
+        assert result.get("semantic_unavailable") is True
+        assert "fastembed" in result["semantic_unavailable_reason"]
+
+    def test_auto_mode_with_fastembed_returns_hybrid(self, sample_pdf, isolated_server):
+        """mode='auto' with fastembed available returns search_mode='hybrid'."""
+        encode, encode_query = self._make_encode()
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(sample_pdf, "page", mode="auto")
+
+        assert result.get("search_mode") == "hybrid"
+
+    def test_hybrid_total_matches_equals_len_matches(self, sample_pdf, isolated_server):
+        """Hybrid mode: total_matches equals len(matches) after RRF fusion."""
+        encode, encode_query = self._make_encode()
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(sample_pdf, "page", mode="auto")
+
+        assert "total_matches" in result
+        assert "page_match_counts" in result
+        assert result["total_matches"] == len(result["matches"])
+
+    def test_hybrid_max_results_honored(self, sample_pdf, isolated_server):
+        """Hybrid mode returns at most max_results matches."""
+        encode, encode_query = self._make_encode()
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(sample_pdf, "page", mode="auto", max_results=2)
+
+        assert len(result["matches"]) <= 2
+
+    def test_hybrid_semantic_only_pages_appear(self, isolated_server, tmp_path):
+        """Pages with no keyword match but high semantic score appear in results."""
+        import pymupdf as _pymupdf
+
+        # Page 1: has keyword "banana"; page 2: unrelated text, wins semantically
+        pdf_path = str(tmp_path / "hybrid_test.pdf")
+        doc = _pymupdf.open()
+        p1 = doc.new_page()
+        p1.insert_text((50, 50), "banana is a yellow fruit")
+        p2 = doc.new_page()
+        p2.insert_text((50, 50), "unrelated filler text here for page two content")
+        doc.save(pdf_path)
+        doc.close()
+
+        dim = 384
+
+        def encode(texts, model_name="BAAI/bge-small-en-v1.5"):
+            # Page 0 (banana page): unit vec at dim 1
+            # Page 1 (filler page): unit vec at dim 0
+            result = np.zeros((len(texts), dim), dtype=np.float32)
+            result[0, 1] = 1.0
+            if len(texts) > 1:
+                result[1, 0] = 1.0
+            return result
+
+        def encode_query(text, model_name="BAAI/bge-small-en-v1.5"):
+            # Query matches dim 0 → page 1 (filler) wins semantically
+            v = np.zeros(dim, dtype=np.float32)
+            v[0] = 1.0
+            return v
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(pdf_path, "banana", mode="auto", max_results=5)
+
+        assert result["search_mode"] == "hybrid"
+        pages_returned = {m["page"] for m in result["matches"]}
+        # Page 2 (1-indexed) should appear even though it has no "banana" keyword
+        assert 2 in pages_returned
+
+    def test_hybrid_excerpt_source(self, isolated_server, tmp_path):
+        """Keyword-hit pages use FTS snippet; semantic-only pages use truncated text."""
+        import pymupdf as _pymupdf
+
+        cache_instance, _ = isolated_server
+        if not cache_instance.fts_available:
+            pytest.skip("FTS5 not available in this SQLite build")
+
+        # Page 1 has keyword; page 2 is semantic-only
+        pdf_path = str(tmp_path / "excerpt_test.pdf")
+        keyword_text = "the quick brown fox jumps over the lazy dog"
+        filler_text = "unrelated content fills this second page entirely"
+        doc = _pymupdf.open()
+        p1 = doc.new_page()
+        p1.insert_text((50, 50), keyword_text)
+        p2 = doc.new_page()
+        p2.insert_text((50, 50), filler_text)
+        doc.save(pdf_path)
+        doc.close()
+
+        dim = 384
+
+        def encode(texts, model_name="BAAI/bge-small-en-v1.5"):
+            result = np.zeros((len(texts), dim), dtype=np.float32)
+            result[0, 1] = 1.0  # page 0: dim 1
+            if len(texts) > 1:
+                result[1, 0] = 1.0  # page 1: dim 0 → wins query
+            return result
+
+        def encode_query(text, model_name="BAAI/bge-small-en-v1.5"):
+            v = np.zeros(dim, dtype=np.float32)
+            v[0] = 1.0
+            return v
+
+        # Pre-populate FTS index
+        pdf_read_pages(pdf_path, "1-2")
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(pdf_path, "fox", mode="auto", max_results=5)
+
+        assert result["search_mode"] == "hybrid"
+        by_page = {m["page"]: m for m in result["matches"]}
+
+        # Page 1 (keyword hit) — FTS snippet should contain the matched word
+        assert 1 in by_page, "Page 1 (keyword hit) must appear in hybrid results"
+        assert "fox" in by_page[1]["excerpt"].lower()
+
+        # Page 2 (semantic only) — excerpt is raw page text prefix, not FTS snippet
+        assert 2 in by_page, "Page 2 (semantic-only) must appear in hybrid results"
+        assert by_page[2]["excerpt"].startswith(filler_text[:20])
+
+    def test_hybrid_embedding_cache_used_on_second_call(
+        self, sample_pdf, isolated_server
+    ):
+        """Second hybrid call hits embedding cache (encode not called again)."""
+        encode, encode_query = self._make_encode()
+        encode_mock = Mock(side_effect=encode)
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode_mock),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            pdf_search(sample_pdf, "page", mode="auto")  # first call — encodes
+            call_count_after_first = encode_mock.call_count
+
+            pdf_search(sample_pdf, "content", mode="auto")  # second call — cache hit
+            call_count_after_second = encode_mock.call_count
+
+        # encode() for page texts should not be called again on second query
+        assert call_count_after_second == call_count_after_first
+
+    def test_default_mode_is_auto(self, sample_pdf, isolated_server):
+        """Calling pdf_search without mode defaults to 'auto' behaviour."""
+        with patch(
+            "pdf_mcp.embedder.check_available",
+            side_effect=ImportError("no fastembed"),
+        ):
+            result = pdf_search(sample_pdf, "page")
+
+        # auto + no fastembed → keyword
+        assert result.get("search_mode") == "keyword"
+
+    def test_total_matches_equals_len_matches_property(
+        self, sample_pdf, isolated_server
+    ):
+        """Property: total_matches == len(matches) across every mode and
+        every query, including multi-word tokenised queries that the
+        1.12.0 LLM evaluation surfaced as the schema regression.
+
+        This is the codified-in-CI version of the cross-mode matrix in
+        the evaluation reports. If a future change reintroduces a
+        meaning-mismatch on total_matches, this test fails the build.
+        """
+        encode, encode_query = self._make_encode()
+        queries = [
+            "page",
+            "pgvector latency",
+            "this string definitely does not appear",
+            "xyznonexistent",
+        ]
+        modes = ["keyword", "semantic", "auto"]
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            for mode in modes:
+                for query in queries:
+                    result = pdf_search(sample_pdf, query, mode=mode)
+                    assert (
+                        "matches" in result
+                    ), f"mode={mode} query={query!r}: missing matches"
+                    assert (
+                        "total_matches" in result
+                    ), f"mode={mode} query={query!r}: missing total_matches"
+                    assert result["total_matches"] == len(result["matches"]), (
+                        f"mode={mode} query={query!r}: "
+                        f"total_matches={result['total_matches']} vs "
+                        f"len(matches)={len(result['matches'])}"
+                    )
+
+    # ── hidden-text flag on keyword / auto hits ──────────────────────────
+
+    def test_keyword_hidden_hit_is_flagged(self, pdf_with_hidden_text, isolated_server):
+        result = pdf_search(pdf_with_hidden_text, "zebra", mode="keyword")
+        assert result["matches"], "expected a keyword hit on the hidden token"
+        hit = next(m for m in result["matches"] if m["page"] == 1)
+        assert hit["hidden_text"] is True
+        assert result["hidden_text_detected"] is True
+
+    def test_keyword_clean_hit_not_flagged(self, pdf_with_hidden_text, isolated_server):
+        result = pdf_search(pdf_with_hidden_text, "omega", mode="keyword")
+        hit = next(m for m in result["matches"] if m["page"] == 2)
+        assert hit["hidden_text"] is False
+        assert result["hidden_text_detected"] is False
+
+    def test_keyword_empty_result_parity(self, pdf_with_hidden_text, isolated_server):
+        result = pdf_search(pdf_with_hidden_text, "nosuchtoken", mode="keyword")
+        assert result["matches"] == []
+        assert result["hidden_text_detected"] is False
+
+    def test_auto_no_fastembed_carries_hidden_flag(
+        self, pdf_with_hidden_text, isolated_server
+    ):
+        with patch(
+            "pdf_mcp.embedder.check_available",
+            side_effect=ImportError("fastembed not installed"),
+        ):
+            result = pdf_search(pdf_with_hidden_text, "zebra", mode="auto")
+        assert result["search_mode"] == "keyword"
+        assert all("hidden_text" in m for m in result["matches"])
+        assert result["hidden_text_detected"] is True
+
+    def test_hybrid_hidden_hit_is_flagged(self, pdf_with_hidden_text, isolated_server):
+        encode, encode_query = self._make_encode()
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(pdf_with_hidden_text, "zebra", mode="auto")
+        assert result["search_mode"] == "hybrid"
+        assert all("hidden_text" in m for m in result["matches"])
+        hit = next(m for m in result["matches"] if m["page"] == 1)
+        assert hit["hidden_text"] is True
+        assert result["hidden_text_detected"] is True
+
+    def test_semantic_hidden_hit_is_flagged(
+        self, pdf_with_hidden_text, isolated_server
+    ):
+        encode, encode_query = self._make_encode()
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(pdf_with_hidden_text, "zebra", mode="semantic")
+        assert all("hidden_text" in m for m in result["matches"])
+        assert any(m["page"] == 1 and m["hidden_text"] for m in result["matches"])
+        assert result["hidden_text_detected"] is True
+
+    def test_semantic_empty_embeddings_parity(self, isolated_server, tmp_path):
+        # A blank page yields no extractable text -> no embeddings -> the
+        # semantic `if not cached_embeddings` early return. It must still
+        # carry hidden_text_detected for response-shape parity.
+        path = str(tmp_path / "blank.pdf")
+        doc = pymupdf.open()
+        doc.new_page()
+        doc.save(path)
+        doc.close()
+        encode, encode_query = self._make_encode()
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(path, "anything", mode="semantic")
+        assert result["matches"] == []
+        assert result["hidden_text_detected"] is False
+
+
+class TestPdfInfo:
+    """Tests for pdf_info tool."""
+
+    def test_pdf_info_basic(self, sample_pdf, isolated_server):
+        """Valid PDF returns expected fields."""
+        result = pdf_info(sample_pdf)
+
+        assert result["page_count"] == 5
+        assert result["from_cache"] is False
+        assert "metadata" in result
+        assert "toc" in result
+        assert "toc_entry_count" in result
+        assert "file_size_bytes" in result
+        assert "file_size_mb" in result
+        assert "estimated_tokens" in result
+        assert "content_warning" in result
+
+    def test_pdf_info_cached(self, sample_pdf, isolated_server):
+        """Second call returns from_cache=True."""
+        result1 = pdf_info(sample_pdf)
+        assert result1["from_cache"] is False
+
+        result2 = pdf_info(sample_pdf)
+        assert result2["from_cache"] is True
+        assert result2["page_count"] == result1["page_count"]
+
+    def test_invalid_path_returns_inline_error(self, isolated_server):
+        """Invalid path returns inline error dict (no raise)."""
+        result = pdf_info("/nonexistent/path.pdf")
+        assert "error" in result
+        assert "PDF file not found" in result["error"]
+        assert "hint" in result
+
+    def test_pdf_info_metadata_fields(self, sample_pdf, isolated_server):
+        """All metadata fields present."""
+        result = pdf_info(sample_pdf)
+
+        metadata = result["metadata"]
+        assert isinstance(metadata, dict)
+        # PyMuPDF metadata keys
+        assert "title" in metadata or metadata == {}
+
+    def test_pdf_info_estimated_tokens(self, sample_pdf, isolated_server):
+        """Token estimation is reasonable."""
+        result = pdf_info(sample_pdf)
+
+        # 5 pages * 800 tokens/page estimate
+        assert result["estimated_tokens"] == 5 * 800
+
+    def test_pdf_info_with_toc(self, sample_pdf_with_toc, isolated_server):
+        """PDF with bookmarks returns toc inline when within limit."""
+        result = pdf_info(sample_pdf_with_toc)
+
+        assert result["toc_entry_count"] == 3
+        assert len(result["toc"]) == 3
+        assert result["toc"][0]["title"] == "Chapter 1"
+        assert "toc_truncated" not in result
+
+    def test_pdf_info_with_toc_entry_count(self, sample_pdf_with_toc, isolated_server):
+        """Small TOC includes toc_entry_count."""
+        result = pdf_info(sample_pdf_with_toc)
+
+        assert result["toc_entry_count"] == 3
+        assert "toc" in result
+        assert "toc_truncated" not in result
+
+    def test_pdf_info_large_toc_truncated(
+        self, sample_pdf_with_large_toc, isolated_server
+    ):
+        """TOC with >50 entries is omitted; toc_truncated and toc_entry_count set."""
+        result = pdf_info(sample_pdf_with_large_toc)
+
+        assert result["toc_entry_count"] == 60
+        assert result["toc_truncated"] is True
+        assert "toc" not in result
+
+    def test_pdf_info_large_toc_truncated_cached(
+        self, sample_pdf_with_large_toc, isolated_server
+    ):
+        """Truncation logic applies on cache-hit path too."""
+        pdf_info(sample_pdf_with_large_toc)  # populate cache
+        result = pdf_info(sample_pdf_with_large_toc)  # cache hit
+
+        assert result["from_cache"] is True
+        assert result["toc_entry_count"] == 60
+        assert result["toc_truncated"] is True
+        assert "toc" not in result
+
+    def test_pdf_info_from_url(self, mock_url_to_pdf, isolated_server):
+        """URL source works (mocked)."""
+        result = pdf_info("https://example.com/test.pdf")
+
+        assert result["page_count"] == 5
+        assert "content_warning" in result
+
+
+class TestPdfReadPages:
+    """Tests for pdf_read_pages tool."""
+
+    def test_read_pages_single(self, sample_pdf, isolated_server):
+        """Single page '1' returns one page."""
+        result = pdf_read_pages(sample_pdf, "1")
+
+        assert len(result["pages"]) == 1
+        assert result["pages"][0]["page"] == 1
+        assert "page 1" in result["pages"][0]["text"].lower()
+        assert result["cache_hits"] == 0
+        assert result["cache_misses"] == 1
+
+    def test_read_pages_range(self, sample_pdf, isolated_server):
+        """Range '1-3' returns three pages."""
+        result = pdf_read_pages(sample_pdf, "1-3")
+
+        assert len(result["pages"]) == 3
+        assert [p["page"] for p in result["pages"]] == [1, 2, 3]
+
+    def test_read_pages_comma_list(self, sample_pdf, isolated_server):
+        """List '1,3,5' returns specific pages."""
+        result = pdf_read_pages(sample_pdf, "1,3,5")
+
+        assert len(result["pages"]) == 3
+        assert [p["page"] for p in result["pages"]] == [1, 3, 5]
+
+    def test_read_pages_empty_result(self, sample_pdf, isolated_server):
+        """Out of bounds pages returns error dict."""
+        result = pdf_read_pages(sample_pdf, "100")
+
+        assert "error" in result
+        assert result["page_count"] == 5
+
+    def test_read_pages_caching(self, sample_pdf, isolated_server):
+        """Second call has cache_hits > 0."""
+        pdf_read_pages(sample_pdf, "1-3")
+        result = pdf_read_pages(sample_pdf, "1-3")
+
+        assert result["cache_hits"] == 3
+        assert result["cache_misses"] == 0
+
+    def test_read_pages_total_chars(self, sample_pdf, isolated_server):
+        """Character count is accurate."""
+        result = pdf_read_pages(sample_pdf, "1")
+
+        expected_chars = sum(p["chars"] for p in result["pages"])
+        assert result["total_chars"] == expected_chars
+
+    def test_read_pages_max_pages_limit_truncation(
+        self, sample_pdf, isolated_server, monkeypatch
+    ):
+        """Requesting more pages than MAX_PAGES_LIMIT truncates to the limit."""
+        import pdf_mcp.server
+
+        monkeypatch.setattr(pdf_mcp.server, "MAX_PAGES_LIMIT", 2)
+        result = pdf_read_pages(sample_pdf, "1-5")
+
+        assert len(result["pages"]) == 2
+
+    def test_read_pages_with_images(self, sample_pdf_with_images, isolated_server):
+        """Pages with images surface an opaque image_id, never the disk path."""
+        result = pdf_read_pages(sample_pdf_with_images, "1")
+        page = result["pages"][0]
+        assert page["image_count"] > 0
+        img = page["images"][0]
+        # Wire-format invariant: image_id is the basename, no absolute path
+        # crosses the wire.
+        assert "image_id" in img
+        assert "path" not in img
+        assert "/" not in img["image_id"] and "\\" not in img["image_id"]
+        assert "data" not in img
+
+
+class TestPdfReadAll:
+    """Tests for pdf_read_all tool."""
+
+    def test_read_all_small_pdf(self, sample_pdf, isolated_server):
+        """Full document, truncated=False."""
+        result = pdf_read_all(sample_pdf)
+
+        assert result["page_count"] == 5
+        assert result["total_pages"] == 5
+        assert result["truncated"] is False
+        assert "full_text" in result
+        assert result["total_chars"] > 0
+
+    def test_read_all_truncation(self, sample_pdf, isolated_server):
+        """max_pages=2 truncates."""
+        result = pdf_read_all(sample_pdf, max_pages=2)
+
+        assert result["page_count"] == 2
+        assert result["total_pages"] == 5
+        assert result["truncated"] is True
+
+    def test_read_all_content_joined(self, sample_pdf, isolated_server):
+        """Pages joined with double newline."""
+        result = pdf_read_all(sample_pdf, max_pages=2)
+
+        # Should contain page separator
+        assert "\n\n" in result["full_text"]
+
+    def test_read_all_caching(self, sample_pdf, isolated_server):
+        """Pages cached for subsequent calls."""
+        pdf_read_all(sample_pdf)
+
+        # Second call via pdf_read_pages should hit cache
+        result = pdf_read_pages(sample_pdf, "1-5")
+        assert result["cache_hits"] == 5
+
+    def test_read_all_cache_hit_path(self, sample_pdf, isolated_server):
+        """Second pdf_read_all call hits cached text path and returns correct data."""
+        result1 = pdf_read_all(sample_pdf)
+        result2 = pdf_read_all(sample_pdf)
+
+        assert result2["page_count"] == 5
+        assert "full_text" in result2
+        assert result2["full_text"] == result1["full_text"]
+
+    def test_invalid_path_returns_inline_error(self, isolated_server):
+        """Invalid path returns inline error dict (no raise)."""
+        result = pdf_read_all("/nonexistent/path.pdf")
+        assert "error" in result
+        assert "PDF file not found" in result["error"]
+        assert "hint" in result
+
+    def test_read_all_docstring_mentions_images(self):
+        """pdf_read_all docstring directs users to pdf_read_pages for images."""
+        assert "pdf_read_pages" in pdf_read_all.__doc__
+        assert "image" in pdf_read_all.__doc__.lower()
+
+
+class TestPdfSearch:
+    """Tests for pdf_search tool."""
+
+    def test_search_found(self, sample_pdf, isolated_server):
+        """Returns matches with page, excerpt, position."""
+        result = pdf_search(sample_pdf, "page 1")
+
+        assert result["total_matches"] >= 1
+        assert len(result["matches"]) >= 1
+
+        match = result["matches"][0]
+        assert "page" in match
+        assert "excerpt" in match
+        assert "position" in match
+
+    def test_search_not_found(self, sample_pdf, isolated_server):
+        """Keyword mode: no keyword match returns empty matches."""
+        result = pdf_search(sample_pdf, "xyznonexistent", mode="keyword")
+
+        assert result["total_matches"] == 0
+        assert len(result["matches"]) == 0
+
+    def test_search_case_insensitive(self, sample_pdf, isolated_server):
+        """'PAGE' finds 'page'."""
+        result = pdf_search(sample_pdf, "PAGE")
+
+        assert result["total_matches"] >= 1
+
+    def test_search_max_results(self, sample_pdf, isolated_server):
+        """Respects limit."""
+        result = pdf_search(sample_pdf, "page", max_results=2)
+
+        assert len(result["matches"]) <= 2
+
+    def test_search_multiple_pages(self, sample_pdf, isolated_server):
+        """Finds across pages — use page_match_counts instead of pages_with_matches."""
+        result = pdf_search(sample_pdf, "content")
+
+        # "content" appears on all 5 pages
+        assert len(result["page_match_counts"]) >= 2
+
+    def test_search_context_chars(self, sample_pdf, isolated_server):
+        """Custom context size works; score field present."""
+        result_small = pdf_search(sample_pdf, "page", context_chars=20)
+        result_large = pdf_search(sample_pdf, "page", context_chars=100)
+
+        if result_small["matches"] and result_large["matches"]:
+            assert len(result_large["matches"][0]["excerpt"]) >= len(
+                result_small["matches"][0]["excerpt"]
+            )
+        if result_small["matches"]:
+            assert "score" in result_small["matches"][0]
+
+
+class TestPdfGetToc:
+    """Tests for pdf_get_toc tool."""
+
+    def test_get_toc_with_toc(self, sample_pdf_with_toc, isolated_server):
+        """PDF with bookmarks returns toc."""
+        result = pdf_get_toc(sample_pdf_with_toc)
+
+        assert result["has_toc"] is True
+        assert result["entry_count"] == 3
+        assert len(result["toc"]) == 3
+
+    def test_get_toc_no_toc(self, sample_pdf, isolated_server):
+        """PDF without bookmarks returns empty."""
+        result = pdf_get_toc(sample_pdf)
+
+        assert result["has_toc"] is False
+        assert result["entry_count"] == 0
+        assert result["toc"] == []
+
+    def test_get_toc_cached(self, sample_pdf_with_toc, isolated_server):
+        """TOC cached after pdf_info populates metadata."""
+        # pdf_get_toc reads from cache set by pdf_info
+        pdf_info(sample_pdf_with_toc)  # Populates metadata cache including TOC
+
+        result = pdf_get_toc(sample_pdf_with_toc)
+        assert result["from_cache"] is True
+
+    def test_get_toc_entry_structure(self, sample_pdf_with_toc, isolated_server):
+        """Entries have level, title, page."""
+        result = pdf_get_toc(sample_pdf_with_toc)
+
+        entry = result["toc"][0]
+        assert "level" in entry
+        assert "title" in entry
+        assert "page" in entry
+
+    def test_get_toc_file_not_found(self, isolated_server):
+        """Invalid path returns inline error dict (no raise)."""
+        result = pdf_get_toc("/nonexistent/path.pdf")
+        assert "error" in result
+        assert "PDF file not found" in result["error"]
+        assert "hint" in result
+
+
+class TestPdfCacheStats:
+    """Tests for pdf_cache_stats tool."""
+
+    def test_cache_stats_empty(self, isolated_server):
+        """Fresh cache returns zeros."""
+        result = pdf_cache_stats()
+
+        assert result["total_files"] == 0
+        assert result["total_pages"] == 0
+
+    def test_cache_stats_after_operations(self, sample_pdf, isolated_server):
+        """Non-zero after reading."""
+        pdf_info(sample_pdf)
+        pdf_read_pages(sample_pdf, "1")
+
+        result = pdf_cache_stats()
+
+        assert result["total_files"] >= 1
+        assert result["total_pages"] >= 1
+
+    def test_cache_stats_includes_url_cache(self, isolated_server):
+        """Has url_cache section."""
+        result = pdf_cache_stats()
+
+        assert "url_cache" in result
+        assert "cached_files" in result["url_cache"]
+
+    def test_cache_stats_structure(self, isolated_server):
+        """All expected keys present, including fts_indexed_pages."""
+        result = pdf_cache_stats()
+
+        expected_keys = [
+            "total_files",
+            "total_pages",
+            "total_images",
+            "fts_indexed_pages",
+            "cache_size_bytes",
+            "cache_size_mb",
+            "url_cache",
+        ]
+        for key in expected_keys:
+            assert key in result
+
+    def test_cache_stats_includes_fts_indexed_pages(self, isolated_server):
+        """pdf_cache_stats response includes fts_indexed_pages."""
+        result = pdf_cache_stats()
+
+        assert "fts_indexed_pages" in result
+        assert isinstance(result["fts_indexed_pages"], int)
+        assert result["fts_indexed_pages"] == 0  # empty cache
+
+    def test_cache_stats_fts_pages_nonzero_after_search(
+        self, sample_pdf, isolated_server
+    ):
+        """fts_indexed_pages > 0 after pdf_search builds the FTS index."""
+        cache_instance, _ = isolated_server
+        if not cache_instance.fts_available:
+            pytest.skip("FTS5 not available in this SQLite build")
+
+        pdf_search(sample_pdf, "page")
+        result = pdf_cache_stats()
+
+        assert result["fts_indexed_pages"] > 0
+
+
+class TestPdfCacheClear:
+    """Tests for pdf_cache_clear tool."""
+
+    def test_cache_clear_empty_cache(self, isolated_server):
+        """No error on empty cache."""
+        result = pdf_cache_clear()
+
+        assert "message" in result
+        assert result["cleared_files"] == 0
+
+    def test_cache_clear_all(self, sample_pdf, isolated_server):
+        """Removes everything."""
+        pdf_info(sample_pdf)
+        pdf_read_pages(sample_pdf, "1-3")
+
+        result = pdf_cache_clear(expired_only=False)
+
+        assert result["expired_only"] is False
+        # Note: cleared_files is -1 when expired_only=False (see server.py:551)
+
+        stats = pdf_cache_stats()
+        assert stats["total_files"] == 0
+        assert stats["total_pages"] == 0
+
+    def test_cache_clear_expired_only(self, sample_pdf, isolated_server):
+        """expired_only=True flag is respected."""
+        pdf_info(sample_pdf)
+
+        result = pdf_cache_clear(expired_only=True)
+
+        assert result["expired_only"] is True
+        # Returns a cleared count (may vary based on datetime handling)
+        assert "cleared_files" in result
+
+    def test_cache_clear_returns_count(self, isolated_server):
+        """Returns cleared count."""
+        result = pdf_cache_clear()
+
+        assert "cleared_files" in result
+        assert isinstance(result["cleared_files"], int)
+
+
+class TestToolIntegration:
+    """Integration tests for tool workflows."""
+
+    def test_info_then_read_uses_cache(self, sample_pdf, isolated_server):
+        """Tools share cache."""
+        pdf_info(sample_pdf)
+
+        # Metadata cached, but page text not yet
+        result = pdf_read_pages(sample_pdf, "1")
+        assert result["cache_misses"] == 1
+
+        # Now page text is cached
+        result2 = pdf_read_pages(sample_pdf, "1")
+        assert result2["cache_hits"] == 1
+
+    def test_search_then_read_workflow(self, sample_pdf, isolated_server):
+        """Search → read pattern — updated for page_match_counts."""
+        search_result = pdf_search(sample_pdf, "page 3")
+
+        if search_result["page_match_counts"]:
+            page_num = int(list(search_result["page_match_counts"].keys())[0])
+            read_result = pdf_read_pages(sample_pdf, str(page_num))
+
+            assert len(read_result["pages"]) == 1
+
+    def test_full_workflow_with_cache_clear(self, sample_pdf, isolated_server):
+        """End-to-end with clear."""
+        # Build up cache
+        pdf_info(sample_pdf)
+        pdf_read_all(sample_pdf)
+
+        stats_before = pdf_cache_stats()
+        assert stats_before["total_pages"] == 5
+
+        # Clear
+        pdf_cache_clear(expired_only=False)
+
+        stats_after = pdf_cache_stats()
+        assert stats_after["total_pages"] == 0
+
+
+class TestErrorCases:
+    """Error handling tests."""
+
+    def test_corrupted_pdf(self, temp_cache_dir, isolated_server):
+        """Corrupted file handled."""
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(b"not a valid pdf content")
+            corrupt_path = f.name
+
+        try:
+            with pytest.raises(Exception):  # PyMuPDF raises various errors
+                pdf_info(corrupt_path)
+        finally:
+            os.unlink(corrupt_path)
+
+
+class TestSecurityMitigations:
+    """Tests for security hardening measures."""
+
+    def test_non_pdf_extension_rejected(self, isolated_server):
+        """Non-PDF file extensions return inline error dict."""
+        import tempfile
+        import os
+
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            f.write(b"not a pdf")
+            txt_path = f.name
+
+        try:
+            result = pdf_info(txt_path)
+            assert "error" in result
+            assert "Only PDF files are supported" in result["error"]
+            assert "hint" in result
+        finally:
+            os.unlink(txt_path)
+
+    def test_content_warning_in_read_pages(self, sample_pdf, isolated_server):
+        """Read pages includes content warning."""
+        result = pdf_read_pages(sample_pdf, "1")
+        assert "content_warning" in result
+
+    def test_content_warning_in_read_all(self, sample_pdf, isolated_server):
+        """Read all includes content warning."""
+        result = pdf_read_all(sample_pdf)
+        assert "content_warning" in result
+
+    def test_content_warning_in_search(self, sample_pdf, isolated_server):
+        """Search includes content warning."""
+        result = pdf_search(sample_pdf, "page")
+        assert "content_warning" in result
+
+    def test_content_warning_in_info(self, sample_pdf, isolated_server):
+        """Info includes content warning."""
+        result = pdf_info(sample_pdf)
+        assert "content_warning" in result
+
+    def test_max_pages_clamped(self, sample_pdf, isolated_server):
+        """Excessively large max_pages is clamped."""
+        # Should not raise or OOM - clamped to MAX_PAGES_LIMIT
+        result = pdf_read_all(sample_pdf, max_pages=999999)
+        assert result["page_count"] == 5  # Only 5 pages in the sample
+
+    def test_max_results_clamped(self, sample_pdf, isolated_server):
+        """Excessively large max_results is clamped to 100."""
+        result = pdf_search(sample_pdf, "page", max_results=999999)
+        # Should not crash, results limited
+        assert isinstance(result["matches"], list)
+
+    def test_file_path_not_leaked_in_info(self, sample_pdf, isolated_server):
+        """Local file paths are not exposed in cached info responses."""
+        pdf_info(sample_pdf)
+        result = pdf_info(sample_pdf)  # Second call hits cache
+        assert result["from_cache"] is True
+        # file_path key should not be in the response
+        assert "file_path" not in result
+
+    def test_content_warning_in_get_toc(self, sample_pdf, isolated_server):
+        """Get TOC includes content warning."""
+        result = pdf_get_toc(sample_pdf)
+        assert "content_warning" in result
+
+    def test_file_size_bytes_in_cached_info(self, sample_pdf, isolated_server):
+        """Cached pdf_info response includes file_size_bytes."""
+        result1 = pdf_info(sample_pdf)
+        assert "file_size_bytes" in result1
+
+        result2 = pdf_info(sample_pdf)
+        assert result2["from_cache"] is True
+        assert "file_size_bytes" in result2
+        assert result2["file_size_bytes"] == result1["file_size_bytes"]
+
+
+class TestResolvePath:
+    """Tests for _resolve_path helper — inline-error contract.
+
+    _resolve_path returns (path, None) on success or
+    (None, {"error", "hint"}) on failure. It does not raise for
+    user-recoverable failures.
+    """
+
+    def test_relative_path_resolved(self, sample_pdf, isolated_server):
+        """Relative path is resolved to an absolute string with no error."""
+        rel_path = os.path.relpath(sample_pdf)
+        local_path, err = _resolve_path(rel_path)
+        assert err is None
+        assert local_path is not None
+        assert os.path.isabs(local_path)
+
+    def test_tilde_path_expands(self, tmp_path, monkeypatch, isolated_server):
+        """~/... paths expand to the home directory, matching the corpus
+        tools (field feedback: pdf_get_toc rejected ~/Downloads/x.pdf)."""
+        doc = pymupdf.open()
+        doc.new_page()
+        doc.save(str(tmp_path / "home_doc.pdf"))
+        doc.close()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        local_path, err = _resolve_path("~/home_doc.pdf")
+        assert err is None
+        assert local_path == str((tmp_path / "home_doc.pdf").resolve())
+
+    def test_url_http_status_error_inline(self, isolated_server):
+        """HTTPStatusError from URL fetch returns inline error dict."""
+        mock_response = Mock()
+        mock_response.status_code = 404
+        error = httpx.HTTPStatusError(
+            "Not Found", request=Mock(), response=mock_response
+        )
+        with patch.object(URLFetcher, "is_url", return_value=True):
+            with patch.object(URLFetcher, "fetch", side_effect=error):
+                local_path, err = _resolve_path("https://example.com/missing.pdf")
+        assert local_path is None
+        assert err is not None
+        assert "HTTP 404" in err["error"]
+        assert "redirect" in err["hint"].lower()
+
+    def test_url_http_error_inline(self, isolated_server):
+        """Generic HTTPError from URL fetch returns inline error dict."""
+        error = httpx.ConnectError("Connection refused")
+        with patch.object(URLFetcher, "is_url", return_value=True):
+            with patch.object(URLFetcher, "fetch", side_effect=error):
+                local_path, err = _resolve_path("https://example.com/unreachable.pdf")
+        assert local_path is None
+        assert err is not None
+        assert "ConnectError" in err["error"]
+        assert "accessible" in err["hint"].lower()
+
+    def test_url_value_error_inline(self, isolated_server):
+        """ValueError from URL fetch surfaces fetcher message verbatim.
+
+        Fetcher composes self-describing errors (SSRF deny list,
+        HTTPS-only, content-type mismatch). _resolve_path preserves them.
+        """
+        error = ValueError("URL does not appear to be a PDF")
+        with patch.object(URLFetcher, "is_url", return_value=True):
+            with patch.object(URLFetcher, "fetch", side_effect=error):
+                local_path, err = _resolve_path("https://example.com/fake.pdf")
+        assert local_path is None
+        assert err is not None
+        assert err["error"] == "URL does not appear to be a PDF"
+        assert "https://" in err["hint"]
+
+    @pytest.mark.parametrize(
+        "fetcher_msg,hint_keyword",
+        [
+            ("Only HTTPS URLs are supported (got: http)", "https://"),
+            (
+                "URL host resolves to a blocked IP on the SSRF deny list",
+                "SSRF deny list",
+            ),
+            ("URL host denied by config: evil.example.com", "[urls]"),
+            ("URL host not in allowed list: foo.example.com", "[urls]"),
+            ("URL content-type 'text/html' is not a PDF", "content-type"),
+            ("URL does not appear to be a PDF", "%PDF"),
+            ("PDF file too large: 999 bytes", "size limit"),
+            ("PDF download exceeded maximum size", "size limit"),
+            ("Too many redirects (max 5)", "redirects"),
+            ("DNS resolution failed for foo: ...", "resolve"),
+            ("Could not extract hostname from URL: ...", "resolve"),
+        ],
+    )
+    def test_url_value_error_per_cause_hint(
+        self, isolated_server, fetcher_msg, hint_keyword
+    ):
+        """Each fetcher ValueError variant maps to a per-cause hint."""
+        with patch.object(URLFetcher, "is_url", return_value=True):
+            with patch.object(URLFetcher, "fetch", side_effect=ValueError(fetcher_msg)):
+                local_path, err = _resolve_path("https://example.com/x.pdf")
+        assert local_path is None
+        assert err is not None
+        assert err["error"] == fetcher_msg
+        assert hint_keyword.lower() in err["hint"].lower()
+
+    def test_bad_extension_inline(self, isolated_server, tmp_path):
+        """Non-.pdf extension returns inline error dict."""
+        not_pdf = tmp_path / "notes.txt"
+        not_pdf.write_text("hi")
+        local_path, err = _resolve_path(str(not_pdf))
+        assert local_path is None
+        assert err is not None
+        assert "Only PDF files are supported" in err["error"]
+        assert ".pdf" in err["hint"]
+
+    def test_not_found_inline(self, isolated_server, tmp_path):
+        """Missing file returns inline error dict."""
+        missing = tmp_path / "does_not_exist.pdf"
+        local_path, err = _resolve_path(str(missing))
+        assert local_path is None
+        assert err is not None
+        assert "PDF file not found" in err["error"]
+        assert "exists" in err["hint"]
+
+
+class TestResolvePathInlineParity:
+    """Every tool that calls _resolve_path returns the same inline
+    {error, hint} shape on path/URL failure.
+
+    Satisfies the ROADMAP deliverable "shape tests across every
+    affected tool" by exercising one local (not-found) failure and
+    one URL (HTTPStatusError) failure per tool.
+    """
+
+    # (tool, extra kwargs needed on top of `path`)
+    TOOLS: list[tuple[Any, dict[str, Any]]] = [
+        (pdf_info, {}),
+        (pdf_read_pages, {"pages": "1"}),
+        (pdf_read_all, {}),
+        (pdf_search, {"query": "anything"}),
+        (pdf_get_toc, {}),
+        (pdf_render_pages, {"pages": "1"}),
+    ]
+
+    @staticmethod
+    def _extract_err(result: Any) -> dict[str, Any]:
+        """pdf_render_pages wraps its error in a single-element list."""
+        if isinstance(result, list):
+            assert len(result) >= 1
+            return result[0]
+        assert isinstance(result, dict)
+        return result
+
+    @pytest.mark.parametrize(
+        "tool,extra",
+        TOOLS,
+        ids=[t.__name__ for t, _ in TOOLS],
+    )
+    def test_not_found_returns_inline_error(
+        self, isolated_server, tmp_path, tool, extra
+    ):
+        missing = tmp_path / "missing.pdf"
+        result = tool(path=str(missing), **extra)
+        err = self._extract_err(result)
+        assert "error" in err, f"{tool.__name__} did not return inline error"
+        assert "PDF file not found" in err["error"]
+        assert "hint" in err
+        assert "exists" in err["hint"].lower()
+
+    @pytest.mark.parametrize(
+        "tool,extra",
+        TOOLS,
+        ids=[t.__name__ for t, _ in TOOLS],
+    )
+    def test_url_http_status_returns_inline_error(self, isolated_server, tool, extra):
+        mock_response = Mock()
+        mock_response.status_code = 503
+        error = httpx.HTTPStatusError(
+            "Service Unavailable", request=Mock(), response=mock_response
+        )
+        with patch.object(URLFetcher, "is_url", return_value=True):
+            with patch.object(URLFetcher, "fetch", side_effect=error):
+                result = tool(path="https://example.com/x.pdf", **extra)
+        err = self._extract_err(result)
+        assert "error" in err
+        assert "HTTP 503" in err["error"]
+        assert "hint" in err
+
+
+class TestSearchWordBoundaryAndEllipsis:
+    """Tests for search excerpt word-boundary adjustment and ellipsis."""
+
+    @pytest.fixture
+    def long_text_pdf(self):
+        """Create a PDF with long text to trigger word-boundary logic."""
+        import pymupdf
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            doc = pymupdf.open()
+            page = doc.new_page()
+
+            # Build text with target in the middle
+            prefix = " ".join(f"word{i}" for i in range(50))
+            suffix = " ".join(f"word{i}" for i in range(50, 100))
+            target = "UNIQUETARGET"
+            long_text = f"{prefix} {target} {suffix}"
+
+            # Use textwriter to insert long text with wrapping
+            tw = pymupdf.TextWriter(page.rect)
+            tw.fill_textbox(
+                pymupdf.Rect(50, 50, 550, 750),
+                long_text,
+                fontsize=10,
+            )
+            tw.write_text(page)
+
+            doc.save(f.name)
+            doc.close()
+
+            yield f.name
+
+            os.unlink(f.name)
+
+    def test_search_excerpt_has_ellipsis(self, long_text_pdf, isolated_server):
+        """Search match in middle of long text gets ellipsis on both sides."""
+        result = pdf_search(
+            long_text_pdf, "UNIQUETARGET", context_chars=50, excerpt_style="snippet"
+        )
+
+        assert result["total_matches"] >= 1
+        match = result["matches"][0]
+        excerpt = match["excerpt"]
+        # Match is in the middle of long text, so excerpt should have ellipsis
+        assert "..." in excerpt
+        assert "UNIQUETARGET" in excerpt
+
+
+class TestReadPagesCachedImages:
+    """Tests for cached image retrieval in pdf_read_pages."""
+
+    def test_images_served_from_cache(self, sample_pdf_with_images, isolated_server):
+        """Second call returns cached images; image_id resolves to the disk PNG."""
+        import pdf_mcp.server as srv
+
+        result1 = pdf_read_pages(sample_pdf_with_images, "1")
+        imgs1 = result1["pages"][0]["images"]
+
+        result2 = pdf_read_pages(sample_pdf_with_images, "1")
+        imgs2 = result2["pages"][0]["images"]
+
+        assert len(imgs1) > 0
+        assert len(imgs2) == len(imgs1)
+        for img in imgs2:
+            assert "image_id" in img
+            assert "path" not in img
+            assert "data" not in img
+            assert (srv.cache.images_dir / img["image_id"]).exists()
+
+
+class TestReadPagesInlineImages:
+    """Tests for always-inline per-page images in pdf_read_pages."""
+
+    def test_read_pages_always_includes_images_field(self, sample_pdf, isolated_server):
+        """Each page dict always has 'images' and 'image_count' fields."""
+        result = pdf_read_pages(sample_pdf, "1")
+        page = result["pages"][0]
+        assert "images" in page
+        assert "image_count" in page
+        assert page["images"] == []
+        assert page["image_count"] == 0
+
+    def test_read_pages_images_nested_per_page(
+        self, sample_pdf_with_images, isolated_server
+    ):
+        """Images are nested inside each page dict, not in a flat top-level list."""
+        result = pdf_read_pages(sample_pdf_with_images, "1")
+        assert "images" not in result  # no top-level 'images' key
+        page = result["pages"][0]
+        assert "images" in page
+        assert isinstance(page["images"], list)
+        assert page["image_count"] == len(page["images"])
+
+    def test_read_pages_no_include_images_param(self):
+        """pdf_read_pages no longer accepts include_images parameter."""
+        import inspect
+
+        sig = inspect.signature(pdf_read_pages)
+        assert "include_images" not in sig.parameters
+
+    def test_read_pages_total_images_in_response(
+        self, sample_pdf_with_images, isolated_server
+    ):
+        """Response includes total_images summing all pages."""
+        result = pdf_read_pages(sample_pdf_with_images, "1")
+        expected = sum(p["image_count"] for p in result["pages"])
+        assert result["total_images"] == expected
+
+    def test_read_pages_image_dict_structure(
+        self, sample_pdf_with_images, isolated_server
+    ):
+        """Each image dict has expected keys; no absolute disk path crosses the wire."""
+        result = pdf_read_pages(sample_pdf_with_images, "1")
+        page = result["pages"][0]
+        assert page["image_count"] > 0
+        img = page["images"][0]
+        assert "index" in img
+        assert "width" in img
+        assert "height" in img
+        assert "format" in img
+        assert "image_id" in img
+        assert "path" not in img  # absolute path no longer on the wire
+        # Basename only — no slash, no parent dirs, no home prefix.
+        assert "/" not in img["image_id"]
+        assert "\\" not in img["image_id"]
+        assert "size_bytes" in img
+        assert "page" not in img  # stripped — redundant with parent
+
+    def test_read_pages_no_images_empty_list(self, sample_pdf, isolated_server):
+        """Text-only pages all return images: [], image_count: 0."""
+        result = pdf_read_pages(sample_pdf, "1-3")
+        for page in result["pages"]:
+            assert page["images"] == []
+            assert page["image_count"] == 0
+
+    def test_read_pages_cache_miss_re_extraction(
+        self, sample_pdf_with_images, isolated_server
+    ):
+        """If cached PNG deleted from disk, re-extraction occurs via pdf_read_pages."""
+        import pdf_mcp.server as srv
+
+        result1 = pdf_read_pages(sample_pdf_with_images, "1")
+        for img in result1["pages"][0]["images"]:
+            (srv.cache.images_dir / img["image_id"]).unlink()
+
+        result2 = pdf_read_pages(sample_pdf_with_images, "1")
+        assert result2["pages"][0]["image_count"] == result1["pages"][0]["image_count"]
+        for img in result2["pages"][0]["images"]:
+            assert (srv.cache.images_dir / img["image_id"]).exists()
+
+    def test_imageless_page_sentinel_cached(self, sample_pdf, isolated_server):
+        """extract_images_from_page called only once for imageless page."""
+        with patch(
+            "pdf_mcp.server.extract_images_from_page", return_value=[]
+        ) as mock_extract:
+            pdf_read_pages(sample_pdf, "1")
+            assert mock_extract.call_count == 1
+
+            pdf_read_pages(sample_pdf, "1")
+            assert mock_extract.call_count == 1  # not called again
+
+    def test_pdf_read_pages_dedups_repeated_image(
+        self, sample_pdf_dup_image, isolated_server
+    ):
+        """An image placed twice yields a single images[] entry."""
+        result = pdf_read_pages(sample_pdf_dup_image, "1")
+        page = result["pages"][0]
+        assert page["image_count"] == 1
+        assert len(page["images"]) == 1
+        assert result["total_images"] == 1
+
+    def test_pdf_info_raster_count_is_distinct(
+        self, sample_pdf_dup_image, isolated_server
+    ):
+        """pdf_info counts distinct raster images, not placements."""
+        result = pdf_info(sample_pdf_dup_image, detail=True)
+        assert result["text_coverage"]["raster_images_per_page"][0] == 1
+
+    def test_pdf_info_raster_count_counts_distinct_images(
+        self, sample_pdf_two_distinct_images, isolated_server
+    ):
+        """Two different images on a page are both counted."""
+        result = pdf_info(sample_pdf_two_distinct_images, detail=True)
+        assert result["text_coverage"]["raster_images_per_page"][0] == 2
+
+    def test_cache_clear_deletes_image_files_via_read_pages(
+        self, sample_pdf_with_images, isolated_server
+    ):
+        """pdf_cache_clear removes image files extracted by pdf_read_pages."""
+        import pdf_mcp.server as srv
+
+        result = pdf_read_pages(sample_pdf_with_images, "1")
+        paths = [
+            srv.cache.images_dir / img["image_id"]
+            for img in result["pages"][0]["images"]
+        ]
+        assert all(p.exists() for p in paths)
+
+        pdf_cache_clear(expired_only=False)
+        assert all(not p.exists() for p in paths)
+
+    def test_cache_stats_includes_image_size_via_read_pages(
+        self, sample_pdf_with_images, isolated_server
+    ):
+        """Cache stats reflect image files extracted via pdf_read_pages."""
+        stats_before = pdf_cache_stats()
+        pdf_read_pages(sample_pdf_with_images, "1")
+        stats_after = pdf_cache_stats()
+        assert stats_after["cache_size_bytes"] > stats_before["cache_size_bytes"]
+
+    def test_pdf_extract_images_tool_removed(self):
+        """pdf_extract_images is no longer defined in server module."""
+        import pdf_mcp.server as mod
+
+        assert not hasattr(mod, "pdf_extract_images")
+
+
+class TestReadPagesInlineTables:
+    """Tests for always-inline per-page tables in pdf_read_pages."""
+
+    def test_read_pages_always_includes_tables_field(self, sample_pdf, isolated_server):
+        """Every page dict has 'tables' (list) and 'table_count' (int)."""
+        result = pdf_read_pages(sample_pdf, "1")
+        page = result["pages"][0]
+        assert "tables" in page
+        assert "table_count" in page
+        assert isinstance(page["tables"], list)
+        assert isinstance(page["table_count"], int)
+        assert page["tables"] == []
+        assert page["table_count"] == 0
+
+    def test_read_pages_tables_nested_per_page(
+        self, sample_pdf_with_table, isolated_server
+    ):
+        """Tables are nested per-page; total_tables is at the top level."""
+        result = pdf_read_pages(sample_pdf_with_table, "1")
+        assert "tables" not in result  # no top-level 'tables' key
+        assert "total_tables" in result
+        page = result["pages"][0]
+        assert "tables" in page
+        assert isinstance(page["tables"], list)
+        assert page["table_count"] == len(page["tables"])
+
+    def test_read_pages_tables_structure(self, sample_pdf_with_table, isolated_server):
+        """Each table dict has required keys; row_count == 1 + len(rows)."""
+        result = pdf_read_pages(sample_pdf_with_table, "1")
+        page = result["pages"][0]
+        assert page["table_count"] > 0
+        table = page["tables"][0]
+        assert "index" in table
+        assert "bbox" in table
+        assert "row_count" in table
+        assert "col_count" in table
+        assert "header" in table
+        assert "rows" in table
+        assert "page" not in table
+        assert isinstance(table["bbox"], list)
+        assert len(table["bbox"]) == 4
+        assert isinstance(table["header"], list)
+        assert isinstance(table["rows"], list)
+        assert table["row_count"] == 1 + len(table["rows"])
+
+    def test_read_pages_tables_cached(self, sample_pdf_with_table, isolated_server):
+        """Second call returns identical table data from cache."""
+        result1 = pdf_read_pages(sample_pdf_with_table, "1")
+        tables1 = result1["pages"][0]["tables"]
+
+        result2 = pdf_read_pages(sample_pdf_with_table, "1")
+        tables2 = result2["pages"][0]["tables"]
+
+        assert len(tables1) > 0
+        assert tables1 == tables2
+
+    def test_read_pages_total_tables_count(
+        self, sample_pdf_with_table, isolated_server
+    ):
+        """Top-level total_tables equals sum of table_count across all page dicts."""
+        result = pdf_read_pages(sample_pdf_with_table, "1")
+        expected = sum(p["table_count"] for p in result["pages"])
+        assert result["total_tables"] == expected
+
+    def test_tableless_page_cached(self, sample_pdf, isolated_server):
+        """extract_tables_from_page called once; [] cached as sentinel."""
+        with patch(
+            "pdf_mcp.server.extract_tables_from_page", return_value=[]
+        ) as mock_extract:
+            pdf_read_pages(sample_pdf, "1")
+            assert mock_extract.call_count == 1
+
+            pdf_read_pages(sample_pdf, "1")
+            assert mock_extract.call_count == 1  # not called again
+
+
+class TestPdfSearchFTS5:
+    """Tests for FTS5-upgraded pdf_search tool."""
+
+    def test_search_empty_query_returns_error(self, sample_pdf, isolated_server):
+        """Empty string query returns error dict without opening the PDF."""
+        result = pdf_search(sample_pdf, "")
+
+        assert "error" in result
+        assert "query" in result
+        assert result["query"] == ""
+        assert "matches" not in result
+
+    def test_search_whitespace_only_query_returns_error(
+        self, sample_pdf, isolated_server
+    ):
+        """Whitespace-only query is rejected as empty."""
+        result = pdf_search(sample_pdf, "   ")
+
+        assert "error" in result
+
+    def test_search_result_has_score_field(self, sample_pdf, isolated_server):
+        """Each match dict includes a 'score' field."""
+        result = pdf_search(sample_pdf, "page")
+
+        assert "matches" in result
+        if result["matches"]:
+            match = result["matches"][0]
+            assert "score" in match
+            assert isinstance(match["score"], float)
+            assert match["score"] >= 0.0
+
+    def test_search_result_has_search_mode_field(self, sample_pdf, isolated_server):
+        """Response includes 'search_mode' string field."""
+        result = pdf_search(sample_pdf, "page")
+
+        assert "search_mode" in result
+        assert result["search_mode"] in ("keyword", "hybrid", "semantic")
+
+    def test_search_uses_fts_after_read_pages(self, sample_pdf, isolated_server):
+        """After pdf_read_pages populates page text cache, pdf_search uses FTS index."""
+        cache_instance, _ = isolated_server
+        if not cache_instance.fts_available:
+            pytest.skip("FTS5 not available in this SQLite build")
+
+        pdf_read_pages(sample_pdf, "1-5")
+        result = pdf_search(sample_pdf, "content")
+
+        assert result["search_mode"] in ("keyword", "hybrid")
+
+    def test_search_fallback_when_not_indexed(self, sample_pdf, isolated_server):
+        """Without prior pdf_read_pages, pdf_search still returns results via scan."""
+        result = pdf_search(sample_pdf, "page")
+
+        assert "matches" in result
+        assert result["total_matches"] >= 1
+        assert "search_mode" in result
+
+    def test_search_indexes_pages_during_scan(self, sample_pdf, isolated_server):
+        """After pdf_search completes a scan, FTS index is populated for that file."""
+        cache_instance, _ = isolated_server
+        if not cache_instance.fts_available:
+            pytest.skip("FTS5 not available in this SQLite build")
+
+        pdf_search(sample_pdf, "page")
+
+        indexed, total = cache_instance.get_fts_index_coverage(sample_pdf)
+        assert indexed == total
+        assert total == 5  # sample_pdf has 5 pages
+
+    def test_search_second_call_uses_fts(self, sample_pdf, isolated_server):
+        """Second pdf_search after first scan returns keyword or hybrid mode."""
+        cache_instance, _ = isolated_server
+        if not cache_instance.fts_available:
+            pytest.skip("FTS5 not available in this SQLite build")
+
+        pdf_search(sample_pdf, "page")  # First call — builds index
+        result2 = pdf_search(sample_pdf, "content")  # Second call — should use FTS
+
+        assert result2["search_mode"] in ("keyword", "hybrid")
+
+    def test_search_page_match_counts_returned(self, sample_pdf, isolated_server):
+        """Response has 'page_match_counts' dict, not 'pages_with_matches' list."""
+        result = pdf_search(sample_pdf, "page")
+
+        assert "page_match_counts" in result
+        assert "pages_with_matches" not in result
+        assert isinstance(result["page_match_counts"], dict)
+
+    def test_search_page_match_counts_keys_are_page_numbers(
+        self, sample_pdf, isolated_server
+    ):
+        """page_match_counts keys are strings of 1-indexed page numbers."""
+        result = pdf_search(sample_pdf, "page")
+
+        for key in result["page_match_counts"]:
+            assert isinstance(key, str)
+            assert int(key) >= 1
+
+    def test_search_total_matches_equals_len_matches_across_max_results(
+        self, sample_pdf, isolated_server
+    ):
+        """total_matches equals len(matches) for every max_results.
+
+        The pre-1.13 contract was total_matches = total occurrences across
+        the document (intentionally independent of max_results). That was
+        the source of the LLM-visible schema disagreement: total_matches
+        could exceed len(matches) without any signal that the rest had
+        been truncated. The schema-parity contract now makes total_matches
+        always equal len(matches); the doc-wide signal lives in
+        page_match_counts.
+        """
+        result_limited = pdf_search(sample_pdf, "page", max_results=1)
+        result_full = pdf_search(sample_pdf, "page", max_results=100)
+
+        assert result_limited["total_matches"] == len(result_limited["matches"])
+        assert result_full["total_matches"] == len(result_full["matches"])
+        assert result_limited["total_matches"] == 1
+        assert result_full["total_matches"] >= 5
+
+    def test_search_stemming_via_fts(self, isolated_server, tmp_path):
+        """FTS5 stemming: query 'search' finds pages with 'searching'."""
+        import pymupdf
+
+        cache_instance, _ = isolated_server
+        if not cache_instance.fts_available:
+            pytest.skip("FTS5 not available in this SQLite build")
+
+        pdf_path = str(tmp_path / "stemming_test.pdf")
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((50, 50), "We are searching for the document")
+        doc.save(pdf_path)
+        doc.close()
+
+        pdf_read_pages(pdf_path, "1")
+        result = pdf_search(pdf_path, "search")
+
+        assert result["total_matches"] >= 1, (
+            "Porter stemmer should match 'searching'; also 'search' is a literal "
+            "substring of 'searching' ensuring total_matches > 0"
+        )
+        assert result["search_mode"] in ("keyword", "hybrid")
+        assert len(result["matches"]) >= 1
+
+    def test_search_no_matches_empty_page_match_counts(
+        self, sample_pdf, isolated_server
+    ):
+        """No keyword matches: total_matches=0, page_match_counts={}, matches=[]."""
+        result = pdf_search(sample_pdf, "xyznonexistent", mode="keyword")
+
+        assert result["total_matches"] == 0
+        assert result["page_match_counts"] == {}
+        assert result["matches"] == []
+
+    def test_search_max_results_clamped_to_100(self, sample_pdf, isolated_server):
+        """max_results=999999 is clamped to 100."""
+        result = pdf_search(sample_pdf, "page", max_results=999999)
+        assert len(result["matches"]) <= 100
+
+    def test_search_content_warning_present(self, sample_pdf, isolated_server):
+        """Response always includes content_warning."""
+        result = pdf_search(sample_pdf, "page")
+        assert "content_warning" in result
+
+    def test_search_query_in_response(self, sample_pdf, isolated_server):
+        """Response echoes back the query string."""
+        result = pdf_search(sample_pdf, "some text")
+        assert result["query"] == "some text"
+
+    def test_search_searched_pages_equals_document_length(
+        self, sample_pdf, isolated_server
+    ):
+        """searched_pages reflects total page count of document."""
+        result = pdf_search(sample_pdf, "page")
+        assert result["searched_pages"] == 5  # sample_pdf has 5 pages
+
+    def test_search_returns_matches_when_fts_unavailable(self, tmp_path):
+        """F3: pdf_search returns non-empty matches even when fts_available=False."""
+        import pymupdf
+        import pdf_mcp.server as server_module
+        from pdf_mcp.cache import PDFCache
+
+        pdf_path = str(tmp_path / "fts_off_test.pdf")
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((50, 50), "The quick brown fox jumps over the lazy dog")
+        doc.save(pdf_path)
+        doc.close()
+
+        no_fts_cache = PDFCache(cache_dir=tmp_path / "cache_no_fts", ttl_hours=1)
+        no_fts_cache.fts_available = False
+
+        original_cache = server_module.cache
+        server_module.cache = no_fts_cache
+        try:
+            result = pdf_search(pdf_path, "fox")
+        finally:
+            server_module.cache = original_cache
+
+        assert result["search_mode"] in ("keyword", "hybrid")
+        assert result["total_matches"] >= 1
+        assert len(result["matches"]) >= 1
+        assert result["matches"][0]["excerpt"]
+
+
+class TestPythonSearch:
+    """Tests for _python_search word-boundary snapping and ellipsis logic."""
+
+    def test_word_boundary_and_ellipsis(self):
+        """Match in long text triggers word-boundary snapping and ellipsis."""
+        prefix = "word " * 20  # 100 chars, many spaces for rfind
+        suffix = "word " * 20
+        text = prefix + "TARGET" + suffix
+        matches, _ = _python_search(
+            {0: text}, "TARGET", max_results=5, context_chars=20
+        )
+        assert len(matches) == 1
+        excerpt = matches[0]["excerpt"]
+        assert excerpt.startswith("...")  # ellipsis prepended (ctx_start > 0)
+        assert excerpt.endswith("...")  # ellipsis appended (ctx_end < len(text))
+
+
+class TestSearchScanCacheHit:
+    """Test that the scan path reuses already-cached page text (server.py:528)."""
+
+    def test_scan_uses_cached_text_for_partially_indexed_file(
+        self, sample_pdf, isolated_server
+    ):
+        """Scan path hits the cached-text branch when FTS is only partially indexed."""
+        cache_instance, _ = isolated_server
+        if not cache_instance.fts_available:
+            pytest.skip("FTS5 not available in this SQLite build")
+
+        # Pre-cache page 0 → FTS has 1 of 5 pages (partial coverage → scan path taken)
+        cache_instance.save_page_text(sample_pdf, 0, "pre-cached page zero content")
+
+        result = pdf_search(sample_pdf, "page")
+
+        assert "matches" in result
+        # After scan, all pages should be indexed
+        indexed, total = cache_instance.get_fts_index_coverage(sample_pdf)
+        assert indexed == total
+
+
+class TestPdfInfoTextCoverage:
+    """Tests for text_coverage field in pdf_info."""
+
+    def test_text_coverage_present(self, sample_pdf, isolated_server):
+        """pdf_info response includes a summary-only text_coverage by default."""
+        result = pdf_info(sample_pdf)
+        assert "text_coverage" in result
+        cov = result["text_coverage"]
+        assert isinstance(cov, dict)
+        assert "summary" in cov
+        assert cov["detail_included"] is False
+        # Per-page arrays omitted by default (keeps payload bounded on big PDFs)
+        assert "text_chars_per_page" not in cov
+        assert "raster_images_per_page" not in cov
+
+    def test_text_coverage_detail_includes_per_page_arrays(
+        self, sample_pdf, isolated_server
+    ):
+        """detail=True returns the parallel per-page arrays."""
+        result = pdf_info(sample_pdf, detail=True)
+        cov = result["text_coverage"]
+        assert cov["detail_included"] is True
+        # sample_pdf has 5 pages
+        assert len(cov["text_chars_per_page"]) == 5
+        assert len(cov["raster_images_per_page"]) == 5
+        assert all(isinstance(c, int) for c in cov["text_chars_per_page"])
+        assert all(isinstance(r, int) for r in cov["raster_images_per_page"])
+
+    def test_text_coverage_text_pages_have_chars(self, sample_pdf, isolated_server):
+        """Pages with text have text_chars > 0 across the array."""
+        result = pdf_info(sample_pdf, detail=True)
+        chars = result["text_coverage"]["text_chars_per_page"]
+        assert all(c > 0 for c in chars)
+
+    def test_text_coverage_image_only_pages(self, sample_pdf_scanned, isolated_server):
+        """Image-only pages: text_chars == 0, raster > 0; summary reflects them."""
+        result = pdf_info(sample_pdf_scanned, detail=True)
+        cov = result["text_coverage"]
+        assert cov["text_chars_per_page"][0] == 0
+        assert cov["raster_images_per_page"][0] > 0
+        assert cov["summary"]["pages_with_only_images"] >= 1
+        # OCR candidate listing surfaces this page (1-indexed)
+        assert 1 in cov["summary"]["ocr_candidate_pages"]
+
+    def test_text_coverage_summary_counts(self, sample_pdf, isolated_server):
+        """Summary rollups equal direct counts over the parallel arrays."""
+        result = pdf_info(sample_pdf, detail=True)
+        cov = result["text_coverage"]
+        chars = cov["text_chars_per_page"]
+        raster = cov["raster_images_per_page"]
+        assert cov["summary"]["pages_with_text"] == sum(1 for c in chars if c > 0)
+        assert cov["summary"]["total_text_chars"] == sum(chars)
+        assert cov["summary"]["pages_with_raster_images"] == sum(
+            1 for r in raster if r > 0
+        )
+
+    def test_text_coverage_summary_independent_of_detail(
+        self, sample_pdf, isolated_server
+    ):
+        """The summary section is identical whether detail is requested or not."""
+        default_summary = pdf_info(sample_pdf)["text_coverage"]["summary"]
+        detailed_summary = pdf_info(sample_pdf, detail=True)["text_coverage"]["summary"]
+        assert default_summary == detailed_summary
+
+    def test_text_coverage_cached_on_second_call(self, sample_pdf, isolated_server):
+        """Second pdf_info call returns same coverage from cache."""
+        r1 = pdf_info(sample_pdf, detail=True)
+        r2 = pdf_info(sample_pdf, detail=True)
+        assert r2["from_cache"] is True
+        assert r2["text_coverage"] == r1["text_coverage"]
+
+    def test_text_coverage_lazy_backfill(self, sample_pdf, isolated_server):
+        """Existing cached row with no coverage gets backfilled on next pdf_info."""
+        import pdf_mcp.server as srv
+
+        # Manually save metadata without coverage to simulate pre-v1.9.0 cache
+        srv.cache.save_metadata(sample_pdf, 5, {}, [], text_coverage=None)
+        result = pdf_info(sample_pdf, detail=True)
+        cov = result["text_coverage"]
+        assert cov is not None
+        assert len(cov["text_chars_per_page"]) == 5
+
+    def test_pdf_info_cold_500_page_under_2s(self, isolated_server, tmp_path):
+        """Cold pdf_info on a 500-page PDF completes under 2 seconds."""
+        import time
+        import pymupdf as _pymupdf
+
+        pdf_path = str(tmp_path / "big.pdf")
+        doc = _pymupdf.open()
+        for i in range(500):
+            page = doc.new_page()
+            page.insert_text((50, 50), f"Page {i + 1} content here.")
+        doc.save(pdf_path)
+        doc.close()
+
+        start = time.monotonic()
+        pdf_info(pdf_path)
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, f"pdf_info took {elapsed:.2f}s on 500-page PDF"
+
+
+class TestPdfReadPagesRender:
+    """Tests for render_dpi parameter on pdf_read_pages."""
+
+    def test_render_dpi_adds_render_id(self, sample_pdf, isolated_server):
+        """render_dpi set -> each page dict has opaque render_id (basename only)."""
+        import pdf_mcp.server as srv
+
+        result = pdf_read_pages(sample_pdf, "1", render_dpi=72)
+        page = result["pages"][0]
+        assert "render_id" in page
+        assert "render_path" not in page  # absolute path no longer on the wire
+        assert "/" not in page["render_id"]
+        assert "\\" not in page["render_id"]
+        assert (srv.cache.renders_dir / page["render_id"]).exists()
+
+    def test_render_dpi_adds_render_size_bytes(self, sample_pdf, isolated_server):
+        """render_dpi set -> each page dict has render_size_bytes > 0."""
+        result = pdf_read_pages(sample_pdf, "1", render_dpi=72)
+        assert result["pages"][0]["render_size_bytes"] > 0
+
+    def test_render_id_resolves_under_renders_dir(self, sample_pdf, isolated_server):
+        """Rendered PNG (resolved via renders_dir) lives under renders_dir."""
+        import pdf_mcp.server as srv
+
+        result = pdf_read_pages(sample_pdf, "1", render_dpi=72)
+        render_path = srv.cache.renders_dir / result["pages"][0]["render_id"]
+        assert render_path.exists()
+        assert srv.cache.renders_dir in render_path.parents
+
+    def test_render_dpi_response_includes_dpi_fields(self, sample_pdf, isolated_server):
+        """Response includes render_dpi_used and render_dpi_requested."""
+        result = pdf_read_pages(sample_pdf, "1", render_dpi=200)
+        assert result["render_dpi_used"] == 200
+        assert result["render_dpi_requested"] == 200
+
+    def test_render_dpi_clamped_high(self, sample_pdf, isolated_server):
+        """render_dpi above 400 is clamped to 400."""
+        result = pdf_read_pages(sample_pdf, "1", render_dpi=1000)
+        assert result["render_dpi_used"] == 400
+        assert result["render_dpi_requested"] == 1000
+
+    def test_render_dpi_clamped_low(self, sample_pdf, isolated_server):
+        """render_dpi below 72 is clamped to 72."""
+        result = pdf_read_pages(sample_pdf, "1", render_dpi=10)
+        assert result["render_dpi_used"] == 72
+
+    def test_render_dpi_cache_hit(self, sample_pdf, isolated_server):
+        """Second call with same render_dpi hits the cache (no re-render)."""
+        from unittest.mock import patch
+
+        pdf_read_pages(sample_pdf, "1", render_dpi=72)  # first call — renders
+        with patch("pdf_mcp.server.render_page_as_png") as mock_render:
+            pdf_read_pages(sample_pdf, "1", render_dpi=72)  # cache hit
+            mock_render.assert_not_called()
+
+    def test_render_dpi_not_set_no_render_id(self, sample_pdf, isolated_server):
+        """Without render_dpi, pages have no render_id key."""
+        result = pdf_read_pages(sample_pdf, "1")
+        page = result["pages"][0]
+        assert "render_id" not in page
+        assert "render_path" not in page  # legacy absolute-path key also absent
+        assert "render_dpi_used" not in result
+
+    def test_cache_clear_removes_render_png(self, sample_pdf, isolated_server):
+        """pdf_cache_clear removes PNGs created by pdf_read_pages render_dpi."""
+        import pdf_mcp.server as srv
+
+        result = pdf_read_pages(sample_pdf, "1", render_dpi=72)
+        png_path = srv.cache.renders_dir / result["pages"][0]["render_id"]
+        assert png_path.exists()
+        pdf_cache_clear(expired_only=False)
+        assert not png_path.exists()
+
+    def test_no_absolute_paths_in_response(
+        self, sample_pdf_with_images, isolated_server
+    ):
+        """Wire-format invariant: pdf_read_pages response carries no
+        absolute filesystem paths. The image/render IDs are content-
+        addressed basenames; absolute paths are unstable across runs
+        and across PDF_MCP_CACHE_DIR changes, so they shouldn't be
+        part of the public response shape."""
+        import json
+
+        result = pdf_read_pages(sample_pdf_with_images, "1", render_dpi=72)
+        serialised = json.dumps(result)
+        # No POSIX absolute paths.
+        assert "/Users/" not in serialised
+        assert "/home/" not in serialised
+        assert "/tmp/" not in serialised
+        assert "/var/" not in serialised
+        # No Windows-style absolute paths.
+        assert ":\\\\" not in serialised
+
+    def test_bidirectional_cache_read_then_render_tool(
+        self, sample_pdf, isolated_server
+    ):
+        """pdf_read_pages(render_dpi=72) populates cache; pdf_render_pages is a hit."""
+        from unittest.mock import patch
+
+        pdf_read_pages(sample_pdf, "1", render_dpi=72)
+        # pdf_render_pages at same DPI should hit the cache
+        with patch("pdf_mcp.server.render_page_as_png") as mock_render:
+            from pdf_mcp.server import pdf_render_pages
+
+            pdf_render_pages(sample_pdf, "1", dpi=72)
+            mock_render.assert_not_called()
+
+
+class TestPdfRenderPages:
+    """Tests for pdf_render_pages tool."""
+
+    def test_returns_list(self, sample_pdf, isolated_server):
+        """pdf_render_pages returns a list (not a dict)."""
+        result = pdf_render_pages(sample_pdf, "1", dpi=72)
+        assert isinstance(result, list)
+
+    def test_first_element_is_summary_dict(self, sample_pdf, isolated_server):
+        """First list element is a dict with pages_rendered and dpi_used."""
+        result = pdf_render_pages(sample_pdf, "1", dpi=72)
+        summary = result[0]
+        assert isinstance(summary, dict)
+        assert "pages_rendered" in summary
+        assert "dpi_used" in summary
+        assert 1 in summary["pages_rendered"]
+
+    def test_subsequent_elements_are_images(self, sample_pdf, isolated_server):
+        """Elements after the summary are MCP ImageContent blocks."""
+        from mcp.types import ImageContent
+
+        result = pdf_render_pages(sample_pdf, "1", dpi=72)
+        assert len(result) == 2  # summary + 1 image
+        assert isinstance(result[1], ImageContent)
+
+    def test_dpi_clamped(self, sample_pdf, isolated_server):
+        """DPI above 400 is clamped; dpi_requested vs dpi_used differ."""
+        result = pdf_render_pages(sample_pdf, "1", dpi=1000)
+        summary = result[0]
+        assert summary["dpi_used"] == 400
+        assert summary["dpi_requested"] == 1000
+
+    def test_max_inline_pages_truncation(self, sample_pdf, isolated_server):
+        """Requesting more than MAX_RENDER_INLINE_PAGES returns truncated_render."""
+        import pdf_mcp.server as srv
+        from mcp.types import ImageContent
+
+        original = srv.MAX_RENDER_INLINE_PAGES
+        srv.MAX_RENDER_INLINE_PAGES = 2
+        try:
+            result = pdf_render_pages(sample_pdf, "1-5", dpi=72)
+        finally:
+            srv.MAX_RENDER_INLINE_PAGES = original
+        image_count = sum(1 for x in result if isinstance(x, ImageContent))
+        assert image_count == 2
+        assert result[0].get("truncated_render") is True
+
+    def test_does_not_have_ocr_parameter(self):
+        """pdf_render_pages does not accept ocr parameter — tools are orthogonal."""
+        import inspect
+
+        sig = inspect.signature(pdf_render_pages)
+        assert "ocr" not in sig.parameters
+
+    def test_bidirectional_cache_render_tool_then_read_pages(
+        self, sample_pdf, isolated_server
+    ):
+        """pdf_render_pages populates cache; pdf_read_pages(render_dpi=72) is a hit."""
+        from unittest.mock import patch
+
+        pdf_render_pages(sample_pdf, "1", dpi=72)
+        with patch("pdf_mcp.server.render_page_as_png") as mock_render:
+            pdf_read_pages(sample_pdf, "1", render_dpi=72)
+            mock_render.assert_not_called()
+
+    def test_rendering_does_not_run_ocr(self, sample_pdf_scanned, isolated_server):
+        """Calling pdf_render_pages does not make pages searchable via pdf_search."""
+        pdf_render_pages(sample_pdf_scanned, "1", dpi=72)
+        # sample_pdf_scanned has no extractable text
+        result = pdf_search(sample_pdf_scanned, "the", mode="keyword")
+        assert result["total_matches"] == 0
+
+    def test_docstring_mentions_vision_models(self):
+        """Tool docstring explicitly mentions vision models."""
+        assert "vision" in pdf_render_pages.__doc__.lower()
+
+    def test_invalid_pages_returns_error_in_summary(self, sample_pdf, isolated_server):
+        """Out-of-range pages returns error in summary dict; no images appended."""
+        result = pdf_render_pages(sample_pdf, "100", dpi=72)
+        assert result[0]["error"]
+        assert len(result) == 1  # images list is empty in error case
+
+    def test_image_blocks_carry_page_in_meta(self, sample_pdf, isolated_server):
+        """Each image content block carries its page number in MCP _meta."""
+        result = pdf_render_pages(sample_pdf, "1-2", dpi=72)
+        blocks = result[1:]
+        assert len(blocks) == 2
+        assert blocks[0].meta == {"page": 1, "dpi": 72}
+        assert blocks[1].meta == {"page": 2, "dpi": 72}
+
+    def test_pages_rendered_aligns_with_image_blocks(self, sample_pdf, isolated_server):
+        """Lockstep invariant: pages_rendered[i] == _meta['page'] of result[i+1]."""
+        result = pdf_render_pages(sample_pdf, "1-3", dpi=72)
+        summary = result[0]
+        blocks = result[1:]
+        assert len(blocks) == len(summary["pages_rendered"])
+        for i, block in enumerate(blocks):
+            assert block.meta["page"] == summary["pages_rendered"][i]
+
+    def test_invariant_holds_when_one_page_read_fails(
+        self, sample_pdf, isolated_server
+    ):
+        """OSError on page 2 must not misalign pages_rendered or image _meta."""
+        from pathlib import Path
+        from unittest.mock import patch
+
+        real_read_bytes = Path.read_bytes
+        call_count = {"n": 0}
+
+        def fake_read_bytes(self):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise OSError("simulated disk failure")
+            return real_read_bytes(self)
+
+        with patch.object(Path, "read_bytes", fake_read_bytes):
+            result = pdf_render_pages(sample_pdf, "1-3", dpi=72)
+
+        summary = result[0]
+        blocks = result[1:]
+        assert summary["pages_rendered"] == [1, 3]
+        assert summary["render_failed_pages"] == [2]
+        assert len(blocks) == 2
+        assert blocks[0].meta["page"] == 1
+        assert blocks[1].meta["page"] == 3
+
+
+class TestRenderBudget:
+    def test_common_case_summary_byte_identical(self, sample_pdf, isolated_server):
+        """Generous budget: no downsample/oversized keys; dpi_used == requested."""
+        result = pdf_render_pages(sample_pdf, "1", dpi=72)
+        summary = result[0]
+        assert summary["dpi_used"] == 72
+        assert "render_downsampled" not in summary
+        assert "render_oversized_pages" not in summary
+        # image block carries _meta.dpi (intentional always-on addition)
+        block = result[1]
+        assert block.meta["page"] == 1
+        assert block.meta["dpi"] == 72
+
+    def test_total_encoded_bytes_within_budget(
+        self, sample_pdf, isolated_server, monkeypatch
+    ):
+        monkeypatch.setattr("pdf_mcp.server.RENDER_RESULT_BYTE_BUDGET", 50_000)
+        result = pdf_render_pages(sample_pdf, "1", dpi=300)
+        total = sum(len(b.data) for b in result[1:])  # b.data is already base64 ascii
+        assert total <= 50_000
+
+    def test_downsample_reported(self, sample_pdf, isolated_server, monkeypatch):
+        # sample_pdf page 1 encodes to ~66k base64 at 300 DPI but only ~8.8k at
+        # the 72-DPI floor, so a 50k budget deterministically forces a
+        # downsample-to-fit (not the common case, not the oversized fallback).
+        monkeypatch.setattr("pdf_mcp.server.RENDER_RESULT_BYTE_BUDGET", 50_000)
+        result = pdf_render_pages(sample_pdf, "1", dpi=300)
+        summary = result[0]
+        assert summary["pages_rendered"] == [1]
+        assert "render_downsampled" in summary
+        ds = summary["render_downsampled"][0]
+        assert ds["page"] == 1
+        assert ds["dpi_requested"] == 300
+        assert ds["dpi_used"] < ds["dpi_requested"]
+        # the inline image block reports the actual (downsampled) render DPI
+        assert result[1].meta["dpi"] == ds["dpi_used"]
+
+    def test_oversized_fallback(self, sample_pdf, isolated_server, monkeypatch):
+        """Tiny budget: page can't fit at 72 -> oversized entry, no image block."""
+        monkeypatch.setattr("pdf_mcp.server.RENDER_RESULT_BYTE_BUDGET", 500)
+        result = pdf_render_pages(sample_pdf, "1", dpi=300)
+        summary = result[0]
+        assert summary["pages_rendered"] == []
+        assert len(result) == 1  # no image blocks
+        assert "render_oversized_pages" in summary
+        entry = summary["render_oversized_pages"][0]
+        assert entry["page"] == 1
+        assert os.path.exists(entry["file_path_on_disk"])
+        assert isinstance(entry["suggestions"], list)
+        assert any("file_path_on_disk" in s for s in entry["suggestions"])
+        assert any("clip=" in s for s in entry["suggestions"])
+
+
+class TestPdfReadPagesOcr:
+    """Tests for ocr and ocr_lang parameters on pdf_read_pages."""
+
+    def test_ocr_error_when_tesseract_missing(self, sample_pdf, isolated_server):
+        """ocr=True returns error dict when Tesseract not installed."""
+        from unittest.mock import patch
+
+        with patch(
+            "pdf_mcp.server.check_tesseract_available",
+            side_effect=RuntimeError("Tesseract not found."),
+        ):
+            result = pdf_read_pages(sample_pdf, "1", ocr=True)
+        assert "error" in result
+        assert "install_hint" in result
+
+    def test_ocr_error_before_path_resolution(self, isolated_server):
+        """Tesseract check fires before path resolution (no FileNotFoundError)."""
+        from unittest.mock import patch
+
+        with patch(
+            "pdf_mcp.server.check_tesseract_available",
+            side_effect=RuntimeError("Tesseract not found."),
+        ):
+            result = pdf_read_pages("/nonexistent/file.pdf", "1", ocr=True)
+        assert "error" in result
+        assert "install_hint" in result
+
+    def test_ocr_false_no_source_in_page(self, sample_pdf, isolated_server):
+        """Without ocr=True, page dicts have no 'source' key."""
+        result = pdf_read_pages(sample_pdf, "1")
+        assert "source" not in result["pages"][0]
+
+    def test_ocr_true_page_has_source(self, sample_pdf, isolated_server, monkeypatch):
+        """ocr=True adds 'source' to each page dict."""
+        from unittest.mock import patch
+
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        with patch("pdf_mcp.server.check_tesseract_available"):
+            with patch(
+                "pdf_mcp.server._ocr_page_worker",
+                side_effect=lambda args: (args[1], "ocr text here"),
+            ):
+                result = pdf_read_pages(sample_pdf, "1", ocr=True)
+        assert "source" in result["pages"][0]
+
+    def test_ocr_true_writes_source_ocr_to_cache(
+        self, sample_pdf, isolated_server, monkeypatch
+    ):
+        """OCR result is stored with source='ocr' in cache."""
+        import pdf_mcp.server as srv
+        from unittest.mock import patch
+
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        with patch("pdf_mcp.server.check_tesseract_available"):
+            with patch(
+                "pdf_mcp.server._ocr_page_worker",
+                side_effect=lambda args: (args[1], "hello from ocr"),
+            ):
+                pdf_read_pages(sample_pdf, "1", ocr=True)
+        source = srv.cache.get_page_source(sample_pdf, 0)
+        assert source == "ocr"
+
+    def test_ocr_cache_hit_does_not_re_ocr(
+        self, sample_pdf, isolated_server, monkeypatch
+    ):
+        """Second ocr=True call does not re-run OCR if source='ocr' cached."""
+        from unittest.mock import patch, MagicMock
+
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        mock_worker = MagicMock(side_effect=lambda args: (args[1], "ocr result"))
+        with patch("pdf_mcp.server.check_tesseract_available"):
+            with patch("pdf_mcp.server._ocr_page_worker", mock_worker):
+                pdf_read_pages(sample_pdf, "1", ocr=True)
+                call_count_first = mock_worker.call_count
+                pdf_read_pages(sample_pdf, "1", ocr=True)
+                call_count_second = mock_worker.call_count
+        assert call_count_second == call_count_first  # not called again
+
+    def test_ocr_different_lang_is_cache_miss(
+        self, sample_pdf, isolated_server, monkeypatch
+    ):
+        """A different ocr_lang re-runs OCR instead of serving the first
+        language's text (issue #25)."""
+        from unittest.mock import patch, MagicMock
+
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        mock_worker = MagicMock(
+            side_effect=lambda args: (args[1], f"text-in-{args[2]}")
+        )
+        with patch("pdf_mcp.server.check_tesseract_available"):
+            with patch("pdf_mcp.server._ocr_page_worker", mock_worker):
+                pdf_read_pages(sample_pdf, "1", ocr=True)  # eng
+                result = pdf_read_pages(sample_pdf, "1", ocr=True, ocr_lang="khm")
+
+        langs = [call.args[0][2] for call in mock_worker.call_args_list]
+        assert langs == ["eng", "khm"]
+        assert result["pages"][0]["text"] == "text-in-khm"
+
+    def test_ocr_same_lang_still_cache_hit(
+        self, sample_pdf, isolated_server, monkeypatch
+    ):
+        """Re-requesting the language already cached does not re-run OCR."""
+        from unittest.mock import patch, MagicMock
+
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        mock_worker = MagicMock(side_effect=lambda args: (args[1], "khmer text"))
+        with patch("pdf_mcp.server.check_tesseract_available"):
+            with patch("pdf_mcp.server._ocr_page_worker", mock_worker):
+                pdf_read_pages(sample_pdf, "1", ocr=True, ocr_lang="khm")
+                first = mock_worker.call_count
+                pdf_read_pages(sample_pdf, "1", ocr=True, ocr_lang="khm")
+                second = mock_worker.call_count
+        assert second == first
+
+    def test_ocr_lang_not_leaked_into_source_field(
+        self, sample_pdf, isolated_server, monkeypatch
+    ):
+        """The user-facing 'source' label stays the coarse 'ocr', with the
+        language kept out of it."""
+        from unittest.mock import patch
+
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        with patch("pdf_mcp.server.check_tesseract_available"):
+            with patch(
+                "pdf_mcp.server._ocr_page_worker",
+                side_effect=lambda args: (args[1], "khmer text"),
+            ):
+                fresh = pdf_read_pages(sample_pdf, "1", ocr=True, ocr_lang="khm")
+                cached = pdf_read_pages(sample_pdf, "1", ocr=True, ocr_lang="khm")
+        assert fresh["pages"][0]["source"] == "ocr"
+        assert cached["pages"][0]["source"] == "ocr"
+
+    def test_ocr_empty_result_not_cached_and_retriggered(
+        self, sample_pdf, isolated_server, monkeypatch
+    ):
+        """Empty OCR result is NOT cached; subsequent calls re-trigger OCR."""
+        import pdf_mcp.server as srv
+        from unittest.mock import patch, MagicMock
+
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        mock_worker = MagicMock(side_effect=lambda args: (args[1], ""))
+        with patch("pdf_mcp.server.check_tesseract_available"):
+            with patch("pdf_mcp.server._ocr_page_worker", mock_worker):
+                pdf_read_pages(sample_pdf, "1", ocr=True)
+                assert srv.cache.get_page_source(sample_pdf, 0) is None  # NOT cached
+                pdf_read_pages(sample_pdf, "1", ocr=True)
+        assert mock_worker.call_count == 2  # called again because not cached
+
+    def test_ocr_skip_page_with_native_text(
+        self, sample_pdf, isolated_server, monkeypatch
+    ):
+        """Page with source='extracted' and non-empty text is not re-OCR'd."""
+        import pdf_mcp.server as srv
+        from unittest.mock import patch, MagicMock
+
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        srv.cache.save_page_text(sample_pdf, 0, "native text here", source="extracted")
+        mock_worker = MagicMock(
+            side_effect=lambda args: (args[1], "should not be called")
+        )
+        with patch("pdf_mcp.server.check_tesseract_available"):
+            with patch("pdf_mcp.server._ocr_page_worker", mock_worker):
+                pdf_read_pages(sample_pdf, "1", ocr=True)
+        mock_worker.assert_not_called()
+
+    def test_ocr_max_pages_limit_truncation(
+        self, sample_pdf, isolated_server, monkeypatch
+    ):
+        """Requesting more than MAX_OCR_PAGES_LIMIT pages sets truncated_ocr."""
+        from unittest.mock import patch
+        import pdf_mcp.server as srv
+
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")  # force sequential (no pickle)
+        original = srv.MAX_OCR_PAGES_LIMIT
+        srv.MAX_OCR_PAGES_LIMIT = 2
+        try:
+            with patch("pdf_mcp.server.check_tesseract_available"):
+                with patch(
+                    "pdf_mcp.server._ocr_page_worker",
+                    side_effect=lambda args: (args[1], "text"),
+                ):
+                    result = pdf_read_pages(sample_pdf, "1-5", ocr=True)
+        finally:
+            srv.MAX_OCR_PAGES_LIMIT = original
+        assert result.get("truncated_ocr") is True
+        assert len(result["pages"]) == 2
+
+    def test_ocr_lang_passed_to_ocr_page(self, sample_pdf, isolated_server):
+        """ocr_lang parameter is forwarded to _ocr_page_worker args."""
+        from unittest.mock import patch
+
+        captured = []
+
+        def mock_worker(args):
+            captured.append(args)
+            return (args[1], "text")
+
+        with patch("pdf_mcp.server.check_tesseract_available"):
+            with patch("pdf_mcp.server._ocr_page_worker", mock_worker):
+                pdf_read_pages(sample_pdf, "1", ocr=True, ocr_lang="fra")
+        assert len(captured) == 1
+        # args = (local_path, page_num, ocr_lang, dpi, tessdata)
+        assert captured[0][2] == "fra"
+
+    def test_ocr_text_searchable_via_pdf_search(
+        self, sample_pdf_scanned, isolated_server
+    ):
+        """OCR'd text is found by pdf_search after pdf_read_pages(ocr=True)."""
+        from unittest.mock import patch
+
+        with patch("pdf_mcp.server.check_tesseract_available"):
+            with patch(
+                "pdf_mcp.server._ocr_page_worker",
+                side_effect=lambda args: (args[1], "the quick brown fox"),
+            ):
+                pdf_read_pages(sample_pdf_scanned, "1", ocr=True)
+        result = pdf_search(sample_pdf_scanned, "fox", mode="keyword")
+        assert result["total_matches"] >= 1
+
+
+class TestPdfSearchSource:
+    """Tests for source field on pdf_search matches (v1.10.0)."""
+
+    def test_search_match_has_source_field(self, sample_pdf, isolated_server):
+        """Each search match includes a 'source' field."""
+        result = pdf_search(sample_pdf, "page", mode="keyword")
+        assert len(result["matches"]) > 0
+        for match in result["matches"]:
+            assert "source" in match
+
+    def test_search_match_source_extracted_for_native_text(
+        self, sample_pdf, isolated_server
+    ):
+        """Matches from native extraction have source='extracted'."""
+        pdf_read_pages(sample_pdf, "1-5")  # populates page_text with source='extracted'
+        result = pdf_search(sample_pdf, "page", mode="keyword")
+        for match in result["matches"]:
+            assert match["source"] == "extracted"
+
+    def test_search_match_source_ocr_for_ocr_text(
+        self, sample_pdf_scanned, isolated_server
+    ):
+        """Matches from OCR'd pages have source='ocr'."""
+        import pdf_mcp.server as srv
+
+        srv.cache.save_page_text(
+            sample_pdf_scanned, 0, "ocr content here", source="ocr"
+        )
+        result = pdf_search(sample_pdf_scanned, "ocr", mode="keyword")
+        assert len(result["matches"]) > 0
+        assert result["matches"][0]["source"] == "ocr"
+
+
+class TestPdfSearchGranularityValidation:
+    """Granularity parameter validation. Section-mode dispatch is tested
+    in a later task (P-C2)."""
+
+    def test_default_granularity_preserves_page_behaviour(
+        self, sample_pdf, isolated_server
+    ):
+        # Calling without `granularity` should behave exactly as before:
+        # returns page-mode shape with `matches`, `search_mode`, etc.
+        result = pdf_search(sample_pdf, "Sample")
+        assert "matches" in result
+        assert "search_mode" in result
+        # Should NOT contain section-mode keys
+        assert "sections" not in result
+
+    def test_invalid_granularity_returns_error(self, sample_pdf, isolated_server):
+        result = pdf_search(sample_pdf, "Sample", granularity="bogus")
+        assert "error" in result
+        assert "granularity" in result["error"].lower()
+
+    def test_explicit_granularity_page_works(self, sample_pdf, isolated_server):
+        # Explicit granularity="page" should work identically to default
+        result = pdf_search(sample_pdf, "Sample", granularity="page")
+        assert "matches" in result
+        assert "sections" not in result
+
+
+class TestPdfSearchSectionMode:
+    """Section-mode dispatch: TOC-first index, BM25 ranking."""
+
+    def test_returns_sections_shape(
+        self, isolated_server, sample_pdf_with_toc_sections
+    ):
+        result = pdf_search(
+            sample_pdf_with_toc_sections, "graph attention", granularity="section"
+        )
+        assert "sections" in result
+        assert result["search_mode"] == "section"
+        # No page-mode keys leak through
+        assert "matches" not in result
+
+    def test_returns_ranked_sections(
+        self, isolated_server, sample_pdf_with_toc_sections
+    ):
+        result = pdf_search(
+            sample_pdf_with_toc_sections, "graph attention", granularity="section"
+        )
+        sections = result["sections"]
+        assert len(sections) >= 1
+        # "Methods" body has the strongest match for "graph attention"
+        assert sections[0]["title"] == "Methods"
+        # Each section dict has the expected keys
+        sec = sections[0]
+        for key in ("section_id", "title", "start_page", "end_page", "score"):
+            assert key in sec
+
+    def test_no_keyword_match_returns_empty_sections(
+        self, isolated_server, sample_pdf_with_toc_sections
+    ):
+        result = pdf_search(
+            sample_pdf_with_toc_sections,
+            "zebra octopus xylophone",
+            granularity="section",
+        )
+        assert result["sections"] == []
+        assert result["search_mode"] == "section"
+
+    def test_title_source_is_toc_when_pdf_has_toc(
+        self, isolated_server, sample_pdf_with_toc_sections
+    ):
+        """title_source == "toc" for sections derived from PyMuPDF's TOC.
+
+        Regression: an earlier implementation derived title_source from
+        the cached pdf_metadata, which meant a pdf_search call BEFORE
+        pdf_info populated the metadata cache would report
+        title_source="heading_detected" on every match — even when
+        derive_sections actually took the TOC path. The fix records
+        title_source on the Section dataclass at detection time and
+        persists it on the FTS row, so the field is correct regardless
+        of call order.
+        """
+        # Call section search FIRST — pdf_info has not run yet, so the
+        # metadata cache is empty for this path. The fix should still
+        # report "toc" because derive_sections takes the TOC path.
+        result = pdf_search(
+            sample_pdf_with_toc_sections, "graph", granularity="section"
+        )
+        assert result["sections"], "fixture should produce matches"
+        for sec in result["sections"]:
+            assert "title_source" in sec
+            assert sec["title_source"] == "toc"
+            assert sec["title"] is not None
+
+    def test_total_sections_reflects_indexed_count(
+        self, isolated_server, sample_pdf_with_toc_sections
+    ):
+        result = pdf_search(
+            sample_pdf_with_toc_sections, "graph", granularity="section"
+        )
+        # The fixture has 5 TOC entries -> 5 sections indexed
+        assert result["total_sections"] == 5
+
+    def test_caches_after_first_call(
+        self, isolated_server, sample_pdf_with_toc_sections
+    ):
+        # First call populates the cache; second call should reuse it.
+        # Both should return the same shape.
+        r1 = pdf_search(sample_pdf_with_toc_sections, "graph", granularity="section")
+        r2 = pdf_search(sample_pdf_with_toc_sections, "graph", granularity="section")
+        assert r1["total_sections"] == r2["total_sections"]
+        assert [s["title"] for s in r1["sections"]] == [
+            s["title"] for s in r2["sections"]
+        ]
+
+
+class TestSearchResponseModelField:
+    """pdf_search response includes model field on semantic/hybrid paths."""
+
+    def _make_encode(self, dim: int = 4):
+        def encode(texts, model_name="BAAI/bge-small-en-v1.5"):
+            return np.ones((len(texts), dim), dtype=np.float32)
+
+        def encode_query(text, model_name="BAAI/bge-small-en-v1.5"):
+            return np.ones(dim, dtype=np.float32)
+
+        return encode, encode_query
+
+    def test_semantic_response_has_model_field(self, sample_pdf, isolated_server):
+        """mode='semantic' response includes model field with configured model name."""
+        from pdf_mcp.server import pdf_search
+
+        encode, encode_query = self._make_encode()
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(sample_pdf, "test", mode="semantic")
+
+        assert "model" in result
+        assert result["model"] == "BAAI/bge-small-en-v1.5"
+
+    def test_hybrid_response_has_model_field(self, sample_pdf, isolated_server):
+        """mode='auto' with fastembed returns model field."""
+        from pdf_mcp.server import pdf_search
+
+        encode, encode_query = self._make_encode()
+
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(sample_pdf, "test", mode="auto")
+
+        if result.get("search_mode") == "hybrid":
+            assert "model" in result
+            assert result["model"] == "BAAI/bge-small-en-v1.5"
+
+    def test_auto_mode_invalid_model_returns_error(self, sample_pdf, isolated_server):
+        """mode='auto' with invalid model name propagates ValueError as error."""
+        from pdf_mcp.server import pdf_search
+
+        with patch(
+            "pdf_mcp.embedder.check_available",
+            side_effect=ValueError("Unknown embedding model 'bad-model'"),
+        ):
+            result = pdf_search(sample_pdf, "page", mode="auto")
+
+        assert "error" in result
+
+
+class TestCacheStatsEmbeddingModel:
+    """pdf_cache_stats includes embedding_model field."""
+
+    def test_cache_stats_has_embedding_model(self, isolated_server):
+        """pdf_cache_stats response includes embedding_model key."""
+        from pdf_mcp.server import pdf_cache_stats
+
+        result = pdf_cache_stats()
+
+        assert "embedding_model" in result
+        assert result["embedding_model"] == "BAAI/bge-small-en-v1.5"
+
+
+class TestExcerptStyle:
+    """Tests for excerpt_style parameter in pdf_search."""
+
+    def test_invalid_excerpt_style_returns_error(self, sample_pdf, isolated_server):
+        result = pdf_search(sample_pdf, "content", excerpt_style="bogus")
+        assert "error" in result
+        assert "excerpt_style" in result["error"]
+
+    def test_default_excerpt_style_is_paragraph(self, sample_pdf, isolated_server):
+        result = pdf_search(sample_pdf, "content")
+        assert result.get("excerpt_style") == "paragraph"
+
+    def test_explicit_snippet_style(self, sample_pdf, isolated_server):
+        result = pdf_search(sample_pdf, "content", excerpt_style="snippet")
+        assert "error" not in result
+
+    def test_keyword_paragraph_excerpt_contains_query_terms(
+        self, sample_pdf, isolated_server
+    ):
+        """Paragraph excerpt must contain at least one query term."""
+        result = pdf_search(
+            sample_pdf, "content", mode="keyword", excerpt_style="paragraph"
+        )
+        assert "error" not in result
+        assert result["excerpt_style"] == "paragraph"
+        assert len(result["matches"]) > 0
+        for m in result["matches"]:
+            assert "content" in m["excerpt"].lower()
+
+    def test_paragraph_picks_correct_block_with_repeated_terms(self, isolated_server):
+        """Regression: on a page with multiple blocks sharing a term,
+        paragraph mode must pick the block with the MOST query-term
+        overlap, not the first block on the page."""
+        import tempfile
+        import pymupdf
+        from pathlib import Path
+
+        doc = pymupdf.open()
+        page = doc.new_page()
+        # Block 0: shares "engineering" but not the distinguishing terms
+        page.insert_text((50, 50), "Define the constructs of engineering.")
+        # Block 1: the target — has "engineering" AND "best practices"
+        page.insert_text(
+            (50, 200),
+            "Identify best practices for engineering improvement.",
+        )
+        # Block 2: unrelated
+        page.insert_text((50, 350), "Unrelated content about cooking.")
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            doc.save(f.name)
+            doc.close()
+            path = str(Path(f.name).resolve())
+            try:
+                result = pdf_search(
+                    path,
+                    "best practices engineering",
+                    mode="keyword",
+                    excerpt_style="paragraph",
+                )
+                assert "error" not in result
+                assert len(result["matches"]) > 0
+                excerpt = result["matches"][0]["excerpt"].lower()
+                assert "best practices" in excerpt
+            finally:
+                os.unlink(path)
+
+    def test_upgrade_deduplicates_same_block(self, isolated_server):
+        """_upgrade_excerpts_to_paragraphs collapses matches in the same block."""
+        import pymupdf
+        from pdf_mcp.server import _upgrade_excerpts_to_paragraphs
+        import tempfile
+
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((50, 50), "alpha beta gamma delta")
+        page.insert_text((50, 200), "epsilon zeta eta theta")
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            doc.save(f.name)
+            doc.close()
+            doc2 = pymupdf.open(f.name)
+            # Simulate two matches on page 1 whose snippets land in block 0
+            fake_matches = [
+                {"page": 1, "excerpt": "alpha beta", "score": 0.9, "position": 0},
+                {"page": 1, "excerpt": "beta gamma", "score": 0.8, "position": 6},
+            ]
+            upgraded = _upgrade_excerpts_to_paragraphs(fake_matches, doc2, "alpha")
+            # Both snippets are in block 0 → deduped to one match
+            assert len(upgraded) == 1
+            assert upgraded[0]["score"] == 0.9  # kept higher score
+            doc2.close()
+            os.unlink(f.name)
+
+    def test_keyword_explicit_snippet_mode(self, sample_pdf, isolated_server):
+        """Explicit snippet mode works and sets excerpt_style='snippet'."""
+        result = pdf_search(
+            sample_pdf, "content", mode="keyword", excerpt_style="snippet"
+        )
+        assert "error" not in result
+        assert len(result["matches"]) > 0
+        assert result.get("excerpt_style") == "snippet"
+
+    @staticmethod
+    def _make_encode(dim: int = 384):
+        import numpy as np
+
+        def encode(texts, model_name="BAAI/bge-small-en-v1.5"):
+            result = np.zeros((len(texts), dim), dtype=np.float32)
+            for i in range(len(texts)):
+                result[i, i % dim] = 1.0
+            return result
+
+        def encode_query(text, model_name="BAAI/bge-small-en-v1.5"):
+            v = np.zeros(dim, dtype=np.float32)
+            v[0] = 1.0
+            return v
+
+        return encode, encode_query
+
+    def test_semantic_paragraph_excerpt_contains_query_terms(
+        self, sample_pdf, isolated_server
+    ):
+        """Semantic paragraph excerpt must contain at least one query term."""
+        encode, encode_query = self._make_encode()
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(
+                sample_pdf, "content", mode="semantic", excerpt_style="paragraph"
+            )
+            assert "error" not in result
+            assert result.get("excerpt_style") == "paragraph"
+            assert len(result["matches"]) > 0
+            for m in result["matches"]:
+                assert "content" in m["excerpt"].lower()
+
+    def test_hybrid_paragraph_excerpt_contains_query_terms(
+        self, sample_pdf, isolated_server
+    ):
+        """Hybrid paragraph excerpt must contain at least one query term."""
+        encode, encode_query = self._make_encode()
+        with (
+            patch("pdf_mcp.embedder.check_available"),
+            patch("pdf_mcp.embedder.encode", encode),
+            patch("pdf_mcp.embedder.encode_query", encode_query),
+        ):
+            result = pdf_search(
+                sample_pdf, "content", mode="auto", excerpt_style="paragraph"
+            )
+            assert "error" not in result
+            assert result.get("excerpt_style") == "paragraph"
+            for m in result["matches"]:
+                assert "content" in m["excerpt"].lower()
+
+    def test_python_fallback_paragraph_mode(self, isolated_server):
+        """When FTS5 is unavailable, python fallback also supports paragraph mode."""
+        import pymupdf
+        from pathlib import Path
+
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((50, 50), "The quick brown fox jumps.")
+        page.insert_text((50, 200), "Lazy dog sleeps all day.")
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            doc.save(f.name)
+            doc.close()
+            path = str(Path(f.name).resolve())
+            try:
+                cache, _ = isolated_server
+                orig = cache.fts_available
+                cache.fts_available = False
+                result = pdf_search(
+                    path, "fox", mode="keyword", excerpt_style="paragraph"
+                )
+                cache.fts_available = orig
+                assert "error" not in result
+                if result["matches"]:
+                    assert result.get("excerpt_style") == "paragraph"
+            finally:
+                os.unlink(path)
+
+    def test_section_granularity_ignores_excerpt_style(
+        self, sample_pdf, isolated_server
+    ):
+        """Section mode ignores excerpt_style — no error, no excerpt_style key."""
+        result = pdf_search(
+            sample_pdf, "content", granularity="section", excerpt_style="paragraph"
+        )
+        assert "error" not in result
+        assert "excerpt_style" not in result
+
+    def test_auto_keyword_fallback_paragraph_mode(self, sample_pdf, isolated_server):
+        """Auto mode falling back to keyword still applies paragraph upgrade."""
+        with patch("pdf_mcp.embedder.check_available", side_effect=ImportError):
+            result = pdf_search(
+                sample_pdf, "content", mode="auto", excerpt_style="paragraph"
+            )
+        assert "error" not in result
+        assert result.get("search_mode") == "keyword"
+        assert result.get("excerpt_style") == "paragraph"
+
+    def test_hybrid_keyword_excerpt_anchors_block_selection(self, isolated_server):
+        """In hybrid mode, keyword excerpt anchors paragraph to the
+        block containing the FTS5 snippet, not the first block with
+        the most token overlap."""
+        from pdf_mcp.server import _upgrade_excerpts_to_paragraphs
+        import tempfile
+        import pymupdf
+
+        doc = pymupdf.open()
+        page = doc.new_page()
+        # Block 0: has "alpha" but not "beta"
+        page.insert_text((50, 50), "alpha concepts and constructs overview")
+        # Block 1: has "alpha" AND "beta" — the FTS5 snippet came from here
+        page.insert_text((50, 200), "alpha beta best practices for improvement")
+        # Block 2: unrelated
+        page.insert_text((50, 350), "unrelated content about cooking")
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            doc.save(f.name)
+            doc.close()
+            doc2 = pymupdf.open(f.name)
+            fake_matches = [
+                {"page": 1, "excerpt": "alpha beta", "score": 0.9},
+            ]
+            upgraded = _upgrade_excerpts_to_paragraphs(
+                fake_matches,
+                doc2,
+                "alpha",
+                keyword_excerpts={0: "alpha beta"},
+            )
+            assert len(upgraded) == 1
+            assert "beta" in upgraded[0]["excerpt"].lower()
+            doc2.close()
+            os.unlink(f.name)
+
+    def test_keyword_excerpt_not_found_falls_back_to_token_overlap(
+        self, isolated_server
+    ):
+        """When the FTS5 snippet doesn't appear verbatim in any block,
+        falls back to get_best_paragraph_for_query."""
+        from pdf_mcp.server import _upgrade_excerpts_to_paragraphs
+        import tempfile
+        import pymupdf
+
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((50, 50), "alpha gamma delta")
+        page.insert_text((50, 200), "epsilon zeta eta")
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            doc.save(f.name)
+            doc.close()
+            doc2 = pymupdf.open(f.name)
+            fake_matches = [
+                {"page": 1, "excerpt": "snippet", "score": 0.5},
+            ]
+            # keyword_excerpts has text that doesn't appear in any block
+            upgraded = _upgrade_excerpts_to_paragraphs(
+                fake_matches,
+                doc2,
+                "alpha gamma",
+                keyword_excerpts={0: "nonexistent snippet text"},
+            )
+            assert len(upgraded) == 1
+            # Falls back to token overlap — picks block with "alpha gamma"
+            assert "alpha" in upgraded[0]["excerpt"].lower()
+            doc2.close()
+            os.unlink(f.name)
+
+    def test_short_block_skipped_in_favor_of_body_paragraph(self, isolated_server):
+        """Heading/caption blocks under the minimum-length floor are
+        skipped; the picker retries with the floor and finds a
+        substantive body block instead."""
+        from pdf_mcp.server import _upgrade_excerpts_to_paragraphs
+        import tempfile
+        import pymupdf
+
+        doc = pymupdf.open()
+        page = doc.new_page()
+        # Block 0: short heading (< 80 chars) — has "attention"
+        page.insert_text((50, 50), "Scaled Dot-Product Attention")
+        # Block 1: body paragraph (> 80 chars) — also has "attention"
+        page.insert_text(
+            (50, 200),
+            (
+                "The attention mechanism computes a weighted sum of"
+                " values based on the compatibility of a query with"
+                " the corresponding keys using scaled dot products."
+            ),
+        )
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            doc.save(f.name)
+            doc.close()
+            doc2 = pymupdf.open(f.name)
+            fake_matches = [
+                {"page": 1, "excerpt": "attention", "score": 0.5},
+            ]
+            upgraded = _upgrade_excerpts_to_paragraphs(fake_matches, doc2, "attention")
+            assert len(upgraded) == 1
+            excerpt = upgraded[0]["excerpt"]
+            # Must pick the body paragraph, not the heading
+            assert len(excerpt) > 80
+            assert "weighted sum" in excerpt.lower()
+            doc2.close()
+            os.unlink(f.name)
+
+
+class TestSearchGeometry:
+    """Paragraph-style pdf_search hits carry bbox/page_rect/clip evidence."""
+
+    def test_search_paragraph_hit_has_geometry(self, isolated_server, tmp_path):
+        from pdf_mcp import server
+
+        pdf = tmp_path / "geo.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page(width=612, height=792)
+        page.insert_text(
+            (72, 200),
+            "Revenue recognition follows the transfer of control to the "
+            "customer over time as obligations are satisfied.",
+            fontsize=11,
+        )
+        page.insert_text(
+            (72, 500),
+            "Unrelated second block about depreciation schedules and "
+            "useful life estimates for fixed assets.",
+            fontsize=11,
+        )
+        doc.save(str(pdf))
+        doc.close()
+
+        res = pdf_search(
+            str(pdf),
+            "revenue recognition control",
+            mode="keyword",
+            excerpt_style="paragraph",
+        )
+        hit = res["matches"][0]
+        assert "bbox" in hit and len(hit["bbox"]) == 4
+        assert "page_rect" in hit and hit["page_rect"] == [0.0, 0.0, 612.0, 792.0]
+        assert "clip" in hit and len(hit["clip"]) == 4
+        # clip is the server-computed fraction of bbox within page_rect
+        assert hit["clip"] == server._bbox_to_clip(hit["bbox"], hit["page_rect"])
+        # bbox round-trips: clip region re-extracts the excerpt
+        # (punctuation-normalized)
+        d2 = pymupdf.open(str(pdf))
+        clip_txt = d2[0].get_text(clip=pymupdf.Rect(hit["bbox"]))
+        d2.close()
+
+        def norm(s: str) -> str:
+            return " ".join(s.lower().replace("-", " ").split())
+
+        assert norm(hit["excerpt"])[:40] in norm(clip_txt)
+
+    @pytest.mark.parametrize("mode", ["keyword", "semantic", "auto"])
+    def test_search_geometry_all_modes(self, isolated_server, tmp_path, mode):
+        if mode == "semantic":
+            try:
+                import fastembed  # noqa: F401
+            except ImportError:
+                pytest.skip("fastembed not installed")
+
+        pdf = tmp_path / f"geo_{mode}.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page(width=612, height=792)
+        page.insert_text(
+            (72, 200),
+            "Transformer models use scaled dot product attention "
+            "across multiple heads in parallel.",
+            fontsize=11,
+        )
+        page.insert_text(
+            (72, 500),
+            "Convolutional networks apply learned filters over "
+            "local receptive fields of the input.",
+            fontsize=11,
+        )
+        doc.save(str(pdf))
+        doc.close()
+        res = pdf_search(
+            str(pdf),
+            "scaled dot product attention",
+            mode=mode,
+            excerpt_style="paragraph",
+        )
+        assert res["matches"], f"no matches in {mode} mode"
+        assert "bbox" in res["matches"][0]
+        assert "clip" in res["matches"][0]
+
+    def test_search_snippet_style_has_no_geometry(self, isolated_server, tmp_path):
+        pdf = tmp_path / "snip.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page(width=612, height=792)
+        page.insert_text(
+            (72, 200),
+            "Alpha beta gamma delta epsilon revenue recognition zeta eta " "theta.",
+            fontsize=11,
+        )
+        doc.save(str(pdf))
+        doc.close()
+        res = pdf_search(
+            str(pdf), "revenue recognition", mode="keyword", excerpt_style="snippet"
+        )
+        assert "bbox" not in res["matches"][0]
+        assert "page_rect" not in res["matches"][0]
+        assert "clip" not in res["matches"][0]
+
+    def test_search_bbox_is_picked_block_not_first_term(
+        self, isolated_server, tmp_path
+    ):
+        # Two blocks both contain "model"; picker should choose the
+        # query-dense block and bbox must belong to THAT block.
+        pdf = tmp_path / "multi.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page(width=612, height=792)
+        page.insert_text(
+            (72, 150),
+            "The model is mentioned here once briefly.",
+            fontsize=11,
+        )
+        page.insert_text(
+            (72, 500),
+            "The language model was pretrained then the model was "
+            "fine-tuned and the model was evaluated.",
+            fontsize=11,
+        )
+        doc.save(str(pdf))
+        doc.close()
+        res = pdf_search(
+            str(pdf),
+            "model pretrained fine-tuned evaluated",
+            mode="keyword",
+            excerpt_style="paragraph",
+        )
+        hit = res["matches"][0]
+        # bbox's vertical position should be the lower (second) block
+        assert hit["bbox"][1] > 300
+
+    def test_search_geometry_cjk(self, isolated_server, tmp_path):
+        # Geometry is writing-direction-agnostic (bbox comes from the block
+        # rect regardless of horizontal/vertical script), so a CJK block is
+        # sufficient coverage; a separate vertical fixture would exercise the
+        # same code path.
+        pdf = tmp_path / "cjk.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page(width=612, height=792)
+        # CJK block with a distinctive term
+        page.insert_text(
+            (72, 200),
+            "厚木基地 の 面積 と 歴史 について 説明 します。",
+            fontsize=14,
+            fontname="japan-s",
+        )
+        doc.save(str(pdf))
+        doc.close()
+        res = pdf_search(
+            str(pdf), "厚木基地", mode="keyword", excerpt_style="paragraph"
+        )
+        assert res["matches"], "CJK keyword search returned no hits"
+        hit = res["matches"][0]
+        assert "bbox" in hit and len(hit["bbox"]) == 4
+        assert hit["bbox"][2] > hit["bbox"][0] and hit["bbox"][3] > hit["bbox"][1]
+
+
+class TestOcrParallelOrchestration:
+    def _two_page_scanned(self, tmp_path):
+        import base64
+        import pymupdf
+
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+        )
+        path = str(tmp_path / "scanned2.pdf")
+        doc = pymupdf.open()
+        for _ in range(2):
+            page = doc.new_page()
+            page.insert_image(pymupdf.Rect(50, 50, 400, 600), stream=png)
+        doc.save(path)
+        doc.close()
+        return path
+
+    def test_ocr_failure_is_isolated_and_not_cached(
+        self, isolated_server, tmp_path, monkeypatch
+    ):
+        cache_instance, _ = isolated_server
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")  # force sequential path
+        path = self._two_page_scanned(tmp_path)
+
+        import pdf_mcp.server as srv
+
+        # No-op the Tesseract gate so this orchestration test runs in CI
+        # without the binary; the worker is mocked anyway.
+        monkeypatch.setattr(srv, "check_tesseract_available", lambda: None)
+        monkeypatch.setattr(
+            srv,
+            "_ocr_page_worker",
+            lambda args: (args[1], PageError("RuntimeError('ocr exploded')")),
+        )
+
+        result = pdf_read_pages(path, "1-2", ocr=True)
+        assert "error" not in result
+        sources = [p.get("source") for p in result["pages"]]
+        assert sources == ["ocr_failed", "ocr_failed"]
+        assert all(p["text"] == "" for p in result["pages"])
+        # Failure must NOT be cached -> page source still absent.
+        assert cache_instance.get_pages_source(path, [0, 1]) == {}
+
+    def test_ocr_response_shape_unchanged(self, isolated_server, tmp_path, monkeypatch):
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        path = self._two_page_scanned(tmp_path)
+
+        import pdf_mcp.server as srv
+
+        # No-op Tesseract + mock the worker so the response-shape check runs in
+        # CI without the binary or real OCR.
+        monkeypatch.setattr(srv, "check_tesseract_available", lambda: None)
+        monkeypatch.setattr(srv, "_ocr_page_worker", lambda args: (args[1], "ocr text"))
+
+        result = pdf_read_pages(path, "1-2", ocr=True)
+        assert set(["pages", "total_chars", "cache_hits", "cache_misses"]).issubset(
+            result.keys()
+        )
+        assert len(result["pages"]) == 2
+
+    def test_ocr_run_pages_bare_sentinel_is_isolated_and_not_cached(
+        self, isolated_server, tmp_path, monkeypatch
+    ):
+        """run_pages itself (not the worker) can yield a bare PageError
+
+        sentinel for a page it never ran (pool timeout/kill) rather than the
+        worker's usual (page_num, payload) tuple. pdf_read_pages must consume
+        that bare sentinel without raising, and treat it as an isolated,
+        non-cached OCR failure — same contract as a worker-reported error.
+
+        This guards the real zip/consumption code in server.py, not a
+        reimplementation of it: if that loop ever regressed to
+        `for pn, res in run_pages(...)` (unpacking each yielded item as a
+        2-tuple), the unpack would TypeError on the bare PageError (not
+        iterable). That TypeError is swallowed by the surrounding
+        `except Exception` — which then silently falls back to sequential
+        per-page `ocr_page()` calls — so the response shape alone would not
+        catch the regression. The `ocr_page` call-count assertion below
+        closes that gap: it fails if the fallback path was entered at all.
+        """
+        cache_instance, _ = isolated_server
+        path = self._two_page_scanned(tmp_path)
+
+        import pdf_mcp.server as srv
+        from unittest.mock import MagicMock
+
+        # No-op the Tesseract gate; run_pages itself is mocked below so no
+        # real worker/pool involvement is needed.
+        monkeypatch.setattr(srv, "check_tesseract_available", lambda: None)
+        monkeypatch.setattr(
+            srv,
+            "run_pages",
+            lambda *args, **kwargs: [PageError("timeout"), PageError("timeout")],
+        )
+        fallback_ocr_page = MagicMock(side_effect=AssertionError("should not run"))
+        monkeypatch.setattr(srv, "ocr_page", fallback_ocr_page)
+
+        result = pdf_read_pages(path, "1-2", ocr=True)
+
+        assert "error" not in result
+        sources = [p.get("source") for p in result["pages"]]
+        assert sources == ["ocr_failed", "ocr_failed"]
+        assert all(p["text"] == "" for p in result["pages"])
+        # Failure must NOT be cached -> page source still absent, and the
+        # call returned normally (bounded — no hang on the mocked pool).
+        assert cache_instance.get_pages_source(path, [0, 1]) == {}
+        # The bare sentinel must be consumed directly, never triggering the
+        # except-Exception sequential fallback (which would call ocr_page()).
+        fallback_ocr_page.assert_not_called()
+
+
+class TestRenderParallelOrchestration:
+    def _multi_page_pdf(self, tmp_path, n=3):
+        import pymupdf
+
+        path = str(tmp_path / f"render{n}.pdf")
+        doc = pymupdf.open()
+        for i in range(n):
+            page = doc.new_page()
+            page.insert_text((50, 50), f"Render page {i + 1}.")
+        doc.save(path)
+        doc.close()
+        return path
+
+    def test_render_failure_listed_and_not_cached(
+        self, isolated_server, tmp_path, monkeypatch
+    ):
+        cache_instance, _ = isolated_server
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        path = self._multi_page_pdf(tmp_path, 2)
+
+        import pdf_mcp.server as srv
+
+        monkeypatch.setattr(
+            srv,
+            "_render_page_worker",
+            lambda args: (args[1], PageError("RuntimeError('render exploded')")),
+        )
+
+        result = pdf_read_pages(path, "1-2", render_dpi=72)
+        assert "error" not in result
+        assert result["render_failed_pages"] == [1, 2]
+        # No render_id on failed pages
+        assert all("render_id" not in p for p in result["pages"])
+        # Failure not cached
+        assert cache_instance.get_page_render(path, 0, 72) is None
+
+    def test_render_success_shape_unchanged(
+        self, isolated_server, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        path = self._multi_page_pdf(tmp_path, 2)
+        result = pdf_read_pages(path, "1-2", render_dpi=72)
+        assert "render_failed_pages" not in result  # absent when none failed
+        assert all("render_id" in p for p in result["pages"])
+        assert result["render_dpi_used"] == 72
+
+
+class TestRenderPagesStaysSequential:
+    def test_inline_cap_is_below_render_gate(self):
+        # The 5-page inline cap must stay below the render gate, so
+        # resolve_workers returns 1 (sequential) for any pdf_render_pages call.
+        import pdf_mcp.server as srv
+        from pdf_mcp.parallel import resolve_workers
+
+        assert srv.MAX_RENDER_INLINE_PAGES < srv._RENDER_PARALLEL_GATE
+        assert (
+            resolve_workers(
+                srv.MAX_RENDER_INLINE_PAGES,
+                srv._RENDER_PARALLEL_GATE,
+                srv._MAX_PARALLEL_WORKERS,
+            )
+            == 1
+        )
+
+
+class TestRenderRealSpawnCorrectness:
+    def _multi_page_pdf(self, tmp_path, n=4):
+        import pymupdf
+
+        path = str(tmp_path / f"spawn{n}.pdf")
+        doc = pymupdf.open()
+        for i in range(n):
+            page = doc.new_page()
+            page.insert_text((50, 50), f"Spawn render page {i + 1}.")
+        doc.save(path)
+        doc.close()
+        return path
+
+    def test_parallel_render_matches_sequential(
+        self, isolated_server, tmp_path, monkeypatch
+    ):
+        import pdf_mcp.server as srv
+
+        # Lower the render gate so 4 pages actually spawn a real pool.
+        monkeypatch.setattr(srv, "_RENDER_PARALLEL_GATE", 2)
+        path = self._multi_page_pdf(tmp_path, 4)
+
+        # Sequential baseline.
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        seq = pdf_read_pages(path, "1-4", render_dpi=72)
+
+        # Clear renders so the parallel run recomputes, then go parallel.
+        cache_instance, _ = isolated_server
+        cache_instance.clear_all()
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "4")
+        par = pdf_read_pages(path, "1-4", render_dpi=72)
+
+        seq_ids = [p["render_id"] for p in seq["pages"]]
+        par_ids = [p["render_id"] for p in par["pages"]]
+        # Deterministic filenames (pdf_hash+page+dpi) -> identical ids + order.
+        assert par_ids == seq_ids
+        assert [p["render_size_bytes"] for p in par["pages"]] == [
+            p["render_size_bytes"] for p in seq["pages"]
+        ]
+
+
+class TestNoCJKKeywordWarning:
+    def test_no_cjk_keyword_warning_in_any_mode(self, sample_pdf, isolated_server):
+        for mode in ("keyword", "semantic", "auto"):
+            resp = pdf_search(sample_pdf, "厚木基地", mode=mode)
+            assert "cjk_keyword_warning" not in resp
+
+
+class TestEncodedLen:
+    def test_matches_base64_formula(self):
+        from pdf_mcp.server import _encoded_len
+
+        for n in (0, 1, 2, 3, 4, 1000, 1001, 1002):
+            raw = b"x" * n
+            assert _encoded_len(raw) == len(base64.b64encode(raw))
+
+    def test_budget_is_conservative(self):
+        from pdf_mcp.server import RENDER_RESULT_BYTE_BUDGET
+
+        assert RENDER_RESULT_BYTE_BUDGET == 900_000
+
+
+class TestRenderClip:
+    def test_clip_renders_inline_subregion(self, sample_pdf, isolated_server):
+        result = pdf_render_pages(sample_pdf, "1", dpi=150, clip=[0.0, 0.0, 0.5, 0.5])
+        summary = result[0]
+        assert summary["clip"] == [0.0, 0.0, 0.5, 0.5]
+        assert summary["pages_rendered"] == [1]
+        block = result[1]
+        assert block.meta["clip"] == [0.0, 0.0, 0.5, 0.5]
+        assert block.meta["dpi"] == 150
+
+    def test_clip_clamps_out_of_range(self, sample_pdf, isolated_server):
+        result = pdf_render_pages(sample_pdf, "1", clip=[0.0, 0.0, 1.03, 1.0])
+        summary = result[0]
+        assert summary["clip"] == [0.0, 0.0, 1.0, 1.0]
+
+    def test_clip_bad_length_errors(self, sample_pdf, isolated_server):
+        result = pdf_render_pages(sample_pdf, "1", clip=[0.0, 0.0, 1.0])
+        assert "error" in result[0]
+
+    def test_clip_non_numeric_errors(self, sample_pdf, isolated_server):
+        result = pdf_render_pages(sample_pdf, "1", clip=[0.0, 0.0, "x", 1.0])
+        assert "error" in result[0]
+
+    def test_clip_multipage_errors(self, sample_pdf_with_toc, isolated_server):
+        result = pdf_render_pages(sample_pdf_with_toc, "1-2", clip=[0.0, 0.0, 0.5, 0.5])
+        assert "error" in result[0]
+        assert "hint" in result[0]
+
+    def test_clip_zero_area_errors(self, sample_pdf, isolated_server):
+        result = pdf_render_pages(sample_pdf, "1", clip=[0.5, 0.0, 0.5, 1.0])
+        assert "error" in result[0]
+
+    def test_clip_bypasses_render_cache(self, sample_pdf, isolated_server):
+        import pdf_mcp.server as srv
+
+        before = srv.cache.get_stats()["total_renders"]
+        pdf_render_pages(sample_pdf, "1", clip=[0.0, 0.0, 0.5, 0.5])
+        after = srv.cache.get_stats()["total_renders"]
+        # no page_renders row written for the clip
+        assert after == before
+
+
+# ---------------------------------------------------------------------------
+# content_trust integration tests
+# ---------------------------------------------------------------------------
+
+
+def _make_pdf_with_hidden_text(path):
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "visible body paragraph text here", fontsize=12)
+    page.insert_text(
+        (72, 200), "white hidden secret content", fontsize=12, color=(1, 1, 1)
+    )
+    doc.save(str(path))
+    doc.close()
+
+
+def test_pdf_info_default_has_no_content_trust(tmp_path, isolated_server):
+    p = tmp_path / "h.pdf"
+    _make_pdf_with_hidden_text(p)
+    res = pdf_info(str(p))
+    assert "content_trust" not in res
+
+
+def test_pdf_info_content_trust_flags_hidden(tmp_path, isolated_server):
+    p = tmp_path / "h.pdf"
+    _make_pdf_with_hidden_text(p)
+    res = pdf_info(str(p), content_trust=True)
+    ct = res["content_trust"]
+    assert ct["suspicious"] is True
+    assert ct["signals"]["white_on_white"] >= 1
+    assert "spans" not in ct  # detail=False
+
+
+def test_pdf_info_content_trust_detail_includes_spans(tmp_path, isolated_server):
+    p = tmp_path / "h.pdf"
+    _make_pdf_with_hidden_text(p)
+    res = pdf_info(str(p), content_trust=True, detail=True)
+    ct = res["content_trust"]
+    assert ct["detail_included"] is True
+    assert isinstance(ct["spans"], list) and ct["spans"]
+
+
+def test_pdf_info_content_trust_is_cached(tmp_path, isolated_server):
+    p = tmp_path / "h.pdf"
+    _make_pdf_with_hidden_text(p)
+    pdf_info(str(p), content_trust=True)
+    # Second call should serve the persisted scan (still correct).
+    res = pdf_info(str(p), content_trust=True)
+    assert res["content_trust"]["suspicious"] is True
+
+
+def test_pdf_info_content_trust_uses_configured_phrases(
+    tmp_path, isolated_server, monkeypatch
+):
+    import pdf_mcp.server
+    from pdf_mcp.config import PDFConfig
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        '[content_trust]\ninjection_phrases = ["purchase the premium plan"]\n'
+    )
+    monkeypatch.setattr(pdf_mcp.server, "pdf_config", PDFConfig(config_path=cfg_path))
+
+    p = tmp_path / "hidden_promo.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    tw = pymupdf.TextWriter(page.rect)
+    tw.append((72, 100), "purchase the premium plan immediately")
+    tw.write_text(page, render_mode=3)  # invisible render mode
+    doc.save(str(p))
+    doc.close()
+
+    res = pdf_info(str(p), content_trust=True)
+    # "purchase the premium plan" is NOT a built-in; only the config makes it
+    # count, proving config flows config -> server -> summarize -> count.
+    assert res["content_trust"]["injection_in_hidden"] >= 1
+
+
+def test_pdf_info_content_trust_malformed_config_degrades_gracefully(
+    tmp_path, isolated_server, monkeypatch
+):
+    """Malformed injection_phrases config must surface as an error block,
+    not raise — the never-raise contract for _content_trust_block."""
+    import pdf_mcp.server
+    from pdf_mcp.config import PDFConfig
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[content_trust]\ninjection_phrases = "not a list"\n')
+    monkeypatch.setattr(pdf_mcp.server, "pdf_config", PDFConfig(config_path=cfg_path))
+
+    p = tmp_path / "simple.pdf"
+    _make_pdf_with_hidden_text(p)
+
+    res = pdf_info(str(p), content_trust=True)
+    ct = res["content_trust"]
+    assert "error" in ct, "malformed config must produce an error key"
+    assert ct["suspicious"] is False
+
+
+# ---------------------------------------------------------------------------
+# Task 6: read-path hidden_text flag
+# ---------------------------------------------------------------------------
+
+
+def test_read_pages_flags_hidden_text(tmp_path, isolated_server):
+    p = tmp_path / "h.pdf"
+    _make_pdf_with_hidden_text(p)
+    res = pdf_read_pages(str(p), "1")
+    assert res["hidden_text_detected"] is True
+    assert res["pages"][0]["hidden_text"] is True
+
+
+def test_read_pages_clean_pdf_not_flagged(tmp_path, isolated_server):
+    p = tmp_path / "c.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "ordinary visible text body", fontsize=12)
+    doc.save(str(p))
+    doc.close()
+    res = pdf_read_pages(str(p), "1")
+    assert res["hidden_text_detected"] is False
+    assert res["pages"][0]["hidden_text"] is False
+
+
+def test_read_pages_flag_is_cached(tmp_path, isolated_server):
+    p = tmp_path / "h.pdf"
+    _make_pdf_with_hidden_text(p)
+    pdf_read_pages(str(p), "1")
+    res = pdf_read_pages(str(p), "1")  # cache hit
+    assert res["cache_hits"] >= 1
+    assert res["pages"][0]["hidden_text"] is True
+
+
+def test_read_all_flags_hidden_text(tmp_path, isolated_server):
+    p = tmp_path / "h.pdf"
+    _make_pdf_with_hidden_text(p)
+    res = pdf_read_all(str(p))
+    assert res["hidden_text_detected"] is True
+
+
+def test_bbox_to_clip_zero_origin():
+    from pdf_mcp.server import _bbox_to_clip
+
+    # Letter page, origin (0,0)
+    clip = _bbox_to_clip([153.0, 396.0, 459.0, 594.0], [0.0, 0.0, 612.0, 792.0])
+    assert clip == [0.25, 0.5, 0.75, 0.75]
+
+
+def test_bbox_to_clip_nonzero_origin():
+    # MANDATORY: proves the origin subtraction. Without it, a non-zero
+    # MediaBox origin yields wrong fractions and every crop is off.
+    from pdf_mcp.server import _bbox_to_clip
+
+    # page rect origin (100, 200), size 612x792
+    clip = _bbox_to_clip([253.0, 596.0, 559.0, 794.0], [100.0, 200.0, 712.0, 992.0])
+    assert clip == [0.25, 0.5, 0.75, 0.75]
+
+
+def test_bbox_to_clip_clamps_and_rounds():
+    from pdf_mcp.server import _bbox_to_clip
+
+    clip = _bbox_to_clip([-10.0, -10.0, 700.0, 900.0], [0.0, 0.0, 612.0, 792.0])
+    assert clip == [0.0, 0.0, 1.0, 1.0]
+
+
+def test_read_pages_page_rect_and_image_clip(isolated_server, sample_pdf_with_images):
+    from pdf_mcp import server
+
+    res = server.pdf_read_pages(sample_pdf_with_images, "1")
+    page = res["pages"][0]
+    assert "page_rect" in page and len(page["page_rect"]) == 4
+    img = page["images"][0]
+    assert "bbox" in img
+    assert "clip" in img
+    assert img["clip"] == server._bbox_to_clip(img["bbox"], page["page_rect"])
+
+
+def test_read_pages_table_bbox_and_clip(isolated_server, tmp_path):
+    import pymupdf
+    from pdf_mcp import server
+
+    pdf = tmp_path / "tbl.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    # a simple ruled table PyMuPDF find_tables can detect
+    page.insert_text((72, 100), "Q1\tQ2\tQ3")
+    page.draw_line((72, 90), (300, 90))
+    page.draw_line((72, 130), (300, 130))
+    for x in (72, 148, 224, 300):
+        page.draw_line((x, 90), (x, 130))
+    doc.save(str(pdf))
+    doc.close()
+
+    res = server.pdf_read_pages(str(pdf), "1")
+    page0 = res["pages"][0]
+    if page0["tables"]:  # detection is heuristic; only assert when found
+        t = page0["tables"][0]
+        assert "bbox" in t
+        assert "clip" in t
+        assert t["clip"] == server._bbox_to_clip(t["bbox"], page0["page_rect"])
+
+
+def test_search_clip_renders_region(isolated_server, tmp_path):
+    from pdf_mcp import server
+    import pymupdf
+
+    pdf = tmp_path / "e2e.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text(
+        (72, 300),
+        "Distinctive marker phrase greppable target "
+        "sitting in the middle of the page body.",
+        fontsize=12,
+    )
+    doc.save(str(pdf))
+    doc.close()
+
+    hit = server.pdf_search(
+        str(pdf),
+        "distinctive marker phrase greppable",
+        mode="keyword",
+        excerpt_style="paragraph",
+    )["matches"][0]
+    out = server.pdf_render_pages(str(pdf), pages="1", clip=hit["clip"])
+    assert isinstance(out, list) and out
+    assert "error" not in out[0]
+
+
+def test_clip_arg_coerces_json_string_at_type_level():
+    # The _ClipArg type coerces a stringified array to a real list, so a
+    # client that stringifies the argument still validates.
+    from pydantic import TypeAdapter
+
+    from pdf_mcp.server import _ClipArg
+
+    ta = TypeAdapter(_ClipArg)
+    assert ta.validate_python("[0.1, 0.2, 0.3, 0.4]") == [0.1, 0.2, 0.3, 0.4]
+    assert ta.validate_python([0.1, 0.2]) == [0.1, 0.2]  # real list still ok
+    assert ta.validate_python(None) is None
+
+
+def test_clip_schema_still_advertises_array():
+    # Coercion must not degrade the published schema: compliant clients must
+    # still see clip typed as array|null, not a bare untyped default.
+    import asyncio
+
+    from pdf_mcp import server
+
+    async def _schema():
+        t = await server.mcp.get_tool("pdf_render_pages")
+        return getattr(t, "parameters", None) or getattr(t, "inputSchema", None)
+
+    props = asyncio.run(_schema())["properties"]["clip"]
+    variants = props.get("anyOf", [props])
+    assert any(v.get("type") == "array" for v in variants), props
+
+
+def test_render_clip_accepts_stringified_array_at_mcp_boundary(
+    isolated_server, tmp_path
+):
+    # A client that stringifies the array arg (observed in the wild) must not
+    # get a hard ValidationError — the paste-the-clip loop has to survive it.
+    import asyncio
+
+    import pymupdf
+
+    from pdf_mcp import server
+
+    pdf = tmp_path / "clip_str.pdf"
+    doc = pymupdf.open()
+    doc.new_page(width=612, height=792).insert_text((72, 200), "hello target")
+    doc.save(str(pdf))
+    doc.close()
+
+    async def _call():
+        t = await server.mcp.get_tool("pdf_render_pages")
+        return await t.run(
+            {"path": str(pdf), "pages": "1", "clip": "[0.1, 0.1, 0.5, 0.5]"}
+        )
+
+    result = asyncio.run(_call())  # must not raise ValidationError
+    assert result is not None
+
+
+def test_geometry_on_shifted_mediabox_pdf(isolated_server, tmp_path):
+    # A PDF whose MediaBox has a non-zero origin: PyMuPDF normalizes page.rect
+    # to (0,0) and reports get_text bboxes in that same normalized space, so
+    # the whole pipeline (bbox -> page_rect -> clip -> render) stays correct.
+    # This is the end-to-end backing for the coordinate-convention design; the
+    # raw origin-subtraction math is unit-tested in test_bbox_to_clip_*.
+    from pdf_mcp import server
+
+    pdf = tmp_path / "shifted.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text(
+        (150, 300),
+        "ORIGINSHIFT distinctive marker paragraph block with enough words "
+        "to be a real body paragraph here.",
+        fontsize=12,
+    )
+    doc.xref_set_key(page.xref, "MediaBox", "[100 200 712 992]")
+    doc.save(str(pdf))
+    doc.close()
+
+    # Confirm the fixture really has a non-zero MediaBox origin...
+    check = pymupdf.open(str(pdf))
+    assert check[0].mediabox.x0 == 100 and check[0].mediabox.y0 == 200
+    # ...yet PyMuPDF normalizes page.rect to origin (0,0).
+    assert check[0].rect.x0 == 0 and check[0].rect.y0 == 0
+    check.close()
+
+    hit = server.pdf_search(
+        str(pdf),
+        "ORIGINSHIFT distinctive marker paragraph",
+        mode="keyword",
+        excerpt_style="paragraph",
+    )["matches"][0]
+
+    assert hit["page_rect"] == [0.0, 0.0, 612.0, 792.0]
+    assert hit["clip"] == server._bbox_to_clip(hit["bbox"], hit["page_rect"])
+
+    # bbox faithfully frames the excerpt in the normalized space
+    d2 = pymupdf.open(str(pdf))
+    clip_txt = d2[0].get_text(clip=pymupdf.Rect(hit["bbox"]))
+    d2.close()
+    assert "ORIGINSHIFT" in clip_txt
+
+    # the emitted clip renders without error
+    out = server.pdf_render_pages(str(pdf), pages="1", clip=hit["clip"])
+    assert isinstance(out, list) and "error" not in out[0]
+
+
+class TestPdfCorpusWarm:
+    def test_warms_directory(self, corpus_dir, isolated_server):
+        result = pdf_corpus_warm(str(corpus_dir))
+        assert "error" not in result
+        assert result["corpus_size"] == 3
+        assert result["warmed_this_call"] == 3
+        assert result["unprocessed"] == []
+        assert result["budget_exhausted"] is False
+        assert {d["status"] for d in result["docs"]} == {"warmed"}
+
+    def test_second_call_all_cached(self, corpus_dir, isolated_server):
+        pdf_corpus_warm(str(corpus_dir))
+        result = pdf_corpus_warm(str(corpus_dir))
+        assert result["warmed_this_call"] == 0
+        assert {d["status"] for d in result["docs"]} == {"cached"}
+
+    def test_missing_directory_inline_error(self, isolated_server):
+        result = pdf_corpus_warm("/nonexistent-dir-for-corpus")
+        assert "error" in result
+        assert "hint" in result
+
+    def test_text_warm_reports_embeddings_cache_state(
+        self, corpus_dir, isolated_server
+    ):
+        """A text-only warm reports per-doc embeddings_cached from actual
+        cache state (no fastembed needed for the check), so a client can
+        decide whether an embeddings pass is required."""
+        result = pdf_corpus_warm(str(corpus_dir))
+        assert all(d["embeddings_cached"] is False for d in result["docs"])
+        assert all("embeddings" not in d for d in result["docs"])
+
+    def test_list_mode_reports_skipped(self, corpus_dir, tmp_path, isolated_server):
+        result = pdf_corpus_warm(
+            [str(corpus_dir / "alpha.pdf"), str(tmp_path / "ghost.pdf")]
+        )
+        assert result["corpus_size"] == 1
+        assert len(result["skipped"]) == 1
+        assert "not found" in result["skipped"][0]["reason"]
+
+
+CORPUS_ENVELOPE_KEYS = {
+    "docs",
+    "unprocessed",
+    "skipped",
+    "corpus_size",
+    "warmed_this_call",
+    "budget_exhausted",
+}
+
+
+class TestPdfCorpusOverview:
+    def test_cards_for_all_docs(self, corpus_dir, isolated_server):
+        result = pdf_corpus_overview(str(corpus_dir))
+        assert "error" not in result
+        assert len(result["docs"]) == 3
+        card = result["docs"][0]
+        assert set(card.keys()) == {
+            "path",
+            "title",
+            "pages",
+            "toc_top",
+            "has_toc",
+            "text_coverage",
+            "size_bytes",
+            "from_cache",
+        }
+        paths = [c["path"] for c in result["docs"]]
+        assert paths == sorted(paths)
+
+    def test_second_call_from_cache(self, corpus_dir, isolated_server):
+        pdf_corpus_overview(str(corpus_dir))
+        result = pdf_corpus_overview(str(corpus_dir))
+        assert result["warmed_this_call"] == 0
+        assert all(c["from_cache"] for c in result["docs"])
+
+    def test_envelope_parity_with_warm(self, corpus_dir, isolated_server):
+        warm = pdf_corpus_warm(str(corpus_dir))
+        overview = pdf_corpus_overview(str(corpus_dir))
+        assert CORPUS_ENVELOPE_KEYS <= set(warm.keys())
+        assert CORPUS_ENVELOPE_KEYS <= set(overview.keys())
+
+    def test_metadata_invalidated_during_call_is_skipped_not_raised(
+        self, corpus_dir, isolated_server
+    ):
+        """cache.get_metadata(path) can return None if the file's mtime
+        changes between warm_docs validating it and the card build. The
+        tool must route that doc to `skipped` instead of crashing."""
+        test_cache, _ = isolated_server
+        pdf_corpus_overview(str(corpus_dir))
+
+        target_path = str(corpus_dir / "alpha.pdf")
+        original_get_metadata = test_cache.get_metadata
+
+        def flaky_get_metadata(path):
+            if path == target_path:
+                return None
+            return original_get_metadata(path)
+
+        test_cache.get_metadata = flaky_get_metadata
+
+        result = pdf_corpus_overview(str(corpus_dir))
+
+        assert "error" not in result
+        skipped_paths = {s["path"]: s["reason"] for s in result["skipped"]}
+        assert skipped_paths[target_path] == "cache invalidated during call"
+        card_paths = [c["path"] for c in result["docs"]]
+        assert target_path not in card_paths
+        assert len(result["docs"]) == 2
+
+
+class TestPdfCorpusSearchKeyword:
+    def test_cross_doc_keyword_hits_with_provenance(self, corpus_dir, isolated_server):
+        result = pdf_corpus_search(str(corpus_dir), "budget", mode="keyword")
+        assert "error" not in result
+        assert result["search_mode"] == "keyword"
+        assert result["total_matches"] == len(result["matches"]) > 0
+        paths = {m["path"] for m in result["matches"]}
+        assert len(paths) >= 2  # "budget" appears in every corpus doc
+        for m in result["matches"]:
+            assert m["page"] >= 1 and "excerpt" in m and "doc_title" in m
+
+    def test_hit_fieldset_is_single_doc_plus_provenance(
+        self, corpus_dir, isolated_server
+    ):
+        single = pdf_search(
+            str(corpus_dir / "alpha.pdf"),
+            "budget",
+            mode="keyword",
+            excerpt_style="snippet",
+        )
+        multi = pdf_corpus_search(
+            str(corpus_dir), "budget", mode="keyword", excerpt_style="snippet"
+        )
+        single_fields = set(single["matches"][0].keys())
+        multi_fields = set(multi["matches"][0].keys())
+        assert multi_fields == single_fields | {"path", "doc_title"}
+
+    def test_doc_match_counts_and_coverage(self, corpus_dir, isolated_server):
+        result = pdf_corpus_search(str(corpus_dir), "budget", mode="keyword")
+        # every doc that produced a match is counted, with a positive count
+        for m in result["matches"]:
+            assert result["doc_match_counts"][m["path"]] >= 1
+        assert result["coverage"] == {"searched": 3, "corpus": 3}
+
+    def test_empty_query_inline_error(self, corpus_dir, isolated_server):
+        result = pdf_corpus_search(str(corpus_dir), "   ", mode="keyword")
+        assert "error" in result
+
+    def test_no_hits_returns_empty_not_error(self, corpus_dir, isolated_server):
+        result = pdf_corpus_search(str(corpus_dir), "zzzqqqxyzzy", mode="keyword")
+        assert result["matches"] == [] and result["total_matches"] == 0
+
+    def test_paragraph_style_carries_geometry(self, corpus_dir, isolated_server):
+        result = pdf_corpus_search(
+            str(corpus_dir), "budget", mode="keyword", excerpt_style="paragraph"
+        )
+        assert result["matches"]
+        geo = [m for m in result["matches"] if "bbox" in m]
+        assert geo and all("clip" in m and "page_rect" in m for m in geo)
+
+
+class TestPdfCorpusSearchDocTitle:
+    """doc_title falls back to the filename stem when PDF metadata has
+    no usable title, so hits stay readable for clients rendering them."""
+
+    def test_missing_metadata_title_falls_back_to_stem(
+        self, corpus_dir, isolated_server
+    ):
+        result = pdf_corpus_search(str(corpus_dir), "budget", mode="keyword")
+        assert result["matches"]
+        for m in result["matches"]:
+            assert m["doc_title"] == Path(m["path"]).stem
+
+    def test_real_metadata_title_wins_over_stem(self, tmp_path, isolated_server):
+        d = tmp_path / "titled_corpus"
+        d.mkdir()
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((50, 50), "Report section 1. The quarterly budget grew.")
+        page.insert_text((50, 300), "Second block. Budget details and notes.")
+        doc.set_metadata({"title": "Quarterly Report FY2026"})
+        doc.save(str(d / "q4.pdf"))
+        doc.close()
+        result = pdf_corpus_search(str(d), "budget", mode="keyword")
+        assert result["matches"]
+        assert result["matches"][0]["doc_title"] == "Quarterly Report FY2026"
+
+    def test_placeholder_metadata_title_falls_back_to_stem(
+        self, tmp_path, isolated_server
+    ):
+        d = tmp_path / "placeholder_corpus"
+        d.mkdir()
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((50, 50), "Report section 1. The quarterly budget grew.")
+        page.insert_text((50, 300), "Second block. Budget details and notes.")
+        doc.set_metadata({"title": "Untitled 3"})
+        doc.save(str(d / "annual-report.pdf"))
+        doc.close()
+        result = pdf_corpus_search(str(d), "budget", mode="keyword")
+        assert result["matches"]
+        assert result["matches"][0]["doc_title"] == "annual-report"
+
+
+class TestPdfCorpusSearchSemanticAuto:
+    @staticmethod
+    def _fake_embedder(monkeypatch):
+        import numpy as np
+        import pdf_mcp.embedder as emb
+
+        def fake_check(model):
+            return None
+
+        def fake_encode(texts, model):
+            # deterministic unit vectors: dim0 weighted by "budget" count
+            out = []
+            for t in texts:
+                v = np.zeros(4, dtype=np.float32)
+                v[0] = 1.0 + t.lower().count("budget")
+                v[1] = 1.0
+                out.append(v / np.linalg.norm(v))
+            return out
+
+        def fake_encode_query(text, model):
+            v = np.array([1.0, 0.1, 0.0, 0.0], dtype=np.float32)
+            return v / np.linalg.norm(v)
+
+        monkeypatch.setattr(emb, "check_available", fake_check)
+        monkeypatch.setattr(emb, "encode", fake_encode)
+        monkeypatch.setattr(emb, "encode_query", fake_encode_query)
+
+    def test_semantic_mode_confidence_signals(
+        self, corpus_dir, isolated_server, monkeypatch
+    ):
+        self._fake_embedder(monkeypatch)
+        result = pdf_corpus_search(str(corpus_dir), "budget", mode="semantic")
+        assert "error" not in result
+        assert result["search_mode"] == "semantic"
+        assert result["confidence_threshold"] == 0.5
+        assert all("low_confidence" in m for m in result["matches"])
+        assert all("score" in m for m in result["matches"])
+        assert not any("semantic_score" in m for m in result["matches"])
+        assert "all_results_low_confidence" in result
+        assert result["total_matches"] == len(result["matches"])
+
+    def test_semantic_hit_fieldset_matches_single_doc_plus_provenance(
+        self, corpus_dir, isolated_server, monkeypatch
+    ):
+        self._fake_embedder(monkeypatch)
+        single = pdf_search(
+            str(corpus_dir / "alpha.pdf"),
+            "budget",
+            mode="semantic",
+            excerpt_style="snippet",
+        )
+        multi = pdf_corpus_search(
+            str(corpus_dir), "budget", mode="semantic", excerpt_style="snippet"
+        )
+        single_fields = set(single["matches"][0].keys())
+        multi_fields = set(multi["matches"][0].keys())
+        assert multi_fields == single_fields | {"path", "doc_title"}
+
+    def test_auto_mode_fuses_and_reports_hybrid(
+        self, corpus_dir, isolated_server, monkeypatch
+    ):
+        self._fake_embedder(monkeypatch)
+        result = pdf_corpus_search(str(corpus_dir), "budget", mode="auto")
+        assert result["search_mode"] == "hybrid"
+        assert result["matches"]
+        for m in result["matches"]:
+            assert "score" in m
+            assert "semantic_score" in m
+            assert "low_confidence" in m
+        assert "all_results_low_confidence" in result
+        assert result["confidence_threshold"] == 0.5
+
+    def test_auto_degrades_without_fastembed(
+        self, corpus_dir, isolated_server, monkeypatch
+    ):
+        import pdf_mcp.embedder as emb
+
+        def boom(model):
+            raise ImportError("fastembed not installed")
+
+        monkeypatch.setattr(emb, "check_available", boom)
+        result = pdf_corpus_search(str(corpus_dir), "budget", mode="auto")
+        assert result["search_mode"] == "keyword"
+        assert result["semantic_unavailable"] is True
+
+    def test_semantic_mode_error_without_fastembed(
+        self, corpus_dir, isolated_server, monkeypatch
+    ):
+        import pdf_mcp.embedder as emb
+
+        def boom(model):
+            raise ImportError("fastembed not installed")
+
+        monkeypatch.setattr(emb, "check_available", boom)
+        result = pdf_corpus_search(str(corpus_dir), "budget", mode="semantic")
+        assert "error" in result
+
+
+class TestPdfCorpusSearchSourceLabel:
+    """Corpus hits report real per-page text provenance ('ocr' vs
+    'extracted'), matching single-doc pdf_search's source contract."""
+
+    @pytest.fixture
+    def mixed_corpus(self, tmp_path):
+        """One image-only (scan-like) PDF plus one text PDF, both
+        matching the query 'budget'."""
+        d = tmp_path / "mixed_corpus"
+        d.mkdir()
+        png_data = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+        )
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_image(pymupdf.Rect(50, 50, 400, 600), stream=png_data)
+        doc.save(str(d / "scanned.pdf"))
+        doc.close()
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((50, 50), "Report section 1. The quarterly budget grew.")
+        page.insert_text((50, 300), "Second block. Budget details and notes.")
+        doc.save(str(d / "textdoc.pdf"))
+        doc.close()
+        return d
+
+    @staticmethod
+    def _ocr_scanned(scanned_path, monkeypatch):
+        """OCR the scanned doc via the mocked worker (no Tesseract)."""
+        monkeypatch.setenv("PDF_MCP_MAX_WORKERS", "1")
+        with patch("pdf_mcp.server.check_tesseract_available"):
+            with patch(
+                "pdf_mcp.server._ocr_page_worker",
+                side_effect=lambda args: (args[1], "Scanned budget memo."),
+            ):
+                result = pdf_read_pages(scanned_path, "1", ocr=True)
+        assert "error" not in result
+
+    def _sources_by_path(self, result, mixed_corpus):
+        scanned = str((mixed_corpus / "scanned.pdf").resolve())
+        textdoc = str((mixed_corpus / "textdoc.pdf").resolve())
+        assert "error" not in result
+        scanned_hits = [m for m in result["matches"] if m["path"] == scanned]
+        text_hits = [m for m in result["matches"] if m["path"] == textdoc]
+        assert scanned_hits and text_hits
+        return scanned_hits, text_hits
+
+    def test_keyword_hit_from_ocr_page_reports_source_ocr(
+        self, mixed_corpus, isolated_server, monkeypatch
+    ):
+        scanned = str((mixed_corpus / "scanned.pdf").resolve())
+        self._ocr_scanned(scanned, monkeypatch)
+        result = pdf_corpus_search(str(mixed_corpus), "budget", mode="keyword")
+        scanned_hits, text_hits = self._sources_by_path(result, mixed_corpus)
+        assert all(m["source"] == "ocr" for m in scanned_hits)
+        assert all(m["source"] == "extracted" for m in text_hits)
+
+    def test_semantic_hit_from_ocr_page_reports_source_ocr(
+        self, mixed_corpus, isolated_server, monkeypatch
+    ):
+        scanned = str((mixed_corpus / "scanned.pdf").resolve())
+        self._ocr_scanned(scanned, monkeypatch)
+        TestPdfCorpusSearchSemanticAuto._fake_embedder(monkeypatch)
+        result = pdf_corpus_search(str(mixed_corpus), "budget", mode="semantic")
+        scanned_hits, text_hits = self._sources_by_path(result, mixed_corpus)
+        assert all(m["source"] == "ocr" for m in scanned_hits)
+        assert all(m["source"] == "extracted" for m in text_hits)
+
+    def test_hybrid_hit_from_ocr_page_reports_source_ocr(
+        self, mixed_corpus, isolated_server, monkeypatch
+    ):
+        scanned = str((mixed_corpus / "scanned.pdf").resolve())
+        self._ocr_scanned(scanned, monkeypatch)
+        TestPdfCorpusSearchSemanticAuto._fake_embedder(monkeypatch)
+        result = pdf_corpus_search(str(mixed_corpus), "budget", mode="auto")
+        assert result["search_mode"] == "hybrid"
+        scanned_hits, text_hits = self._sources_by_path(result, mixed_corpus)
+        assert all(m["source"] == "ocr" for m in scanned_hits)
+        assert all(m["source"] == "extracted" for m in text_hits)
+
+
+class TestPdfCorpusSearchNoFts:
+    """Without FTS5, corpus keyword search falls back to Python token
+    matching (parity with single-doc pdf_search) instead of silently
+    returning zero matches."""
+
+    def test_keyword_mode_returns_matches_without_fts(
+        self, corpus_dir, isolated_server
+    ):
+        cache_instance, _ = isolated_server
+        cache_instance.fts_available = False
+        result = pdf_corpus_search(str(corpus_dir), "budget", mode="keyword")
+        assert "error" not in result
+        assert result["total_matches"] >= 1
+        paths = {m["path"] for m in result["matches"]}
+        assert len(paths) >= 2  # "budget" appears in every corpus doc
+        for m in result["matches"]:
+            assert m["excerpt"]
+        for path, count in result["doc_match_counts"].items():
+            assert count >= 1
+
+    def test_auto_degraded_returns_matches_without_fts(
+        self, corpus_dir, isolated_server, monkeypatch
+    ):
+        import pdf_mcp.embedder as emb
+
+        def boom(model):
+            raise ImportError("fastembed not installed")
+
+        monkeypatch.setattr(emb, "check_available", boom)
+        cache_instance, _ = isolated_server
+        cache_instance.fts_available = False
+        result = pdf_corpus_search(str(corpus_dir), "budget", mode="auto")
+        assert result["search_mode"] == "keyword"
+        assert result["semantic_unavailable"] is True
+        assert result["total_matches"] >= 1
+
+    def test_fallback_ranks_by_occurrence_within_doc(self, tmp_path, isolated_server):
+        """The fallback re-ranks a doc's hits best-first by token
+        occurrences so RRF fusion sees a relevance-ordered rank list."""
+        d = tmp_path / "one_doc_corpus"
+        d.mkdir()
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((50, 50), "Intro block mentioning budget once.")
+        page.insert_text((50, 300), "Unrelated filler text block.")
+        page = doc.new_page()
+        page.insert_text((50, 50), "Budget summary: the budget grew.")
+        page.insert_text((50, 300), "Detailed budget appendix table.")
+        doc.save(str(d / "single.pdf"))
+        doc.close()
+
+        cache_instance, _ = isolated_server
+        cache_instance.fts_available = False
+        result = pdf_corpus_search(str(d), "budget", mode="keyword")
+        assert "error" not in result
+        assert [m["page"] for m in result["matches"]] == [2, 1]
+
+
+class TestParagraphBlockTokenGuard:
+    """excerpt_style='paragraph' must not swap a high-coverage short
+    block for a longer block with lower query-token coverage
+    (field-reported: a datasheet table hit was replaced by an ESD note
+    block containing only one query term, with a bbox pointing at the
+    wrong region)."""
+
+    QUERY = "reverse standoff voltage"
+
+    @pytest.fixture
+    def datasheet_pdf(self, tmp_path):
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text(
+            (50, 60),
+            "The SP05 series provides transient protection for data lines.",
+        )
+        # Table-like region: short cell blocks.
+        page.insert_text((50, 150), "Parameter")
+        page.insert_text((250, 150), "Symbol")
+        page.insert_text((400, 150), "Value")
+        page.insert_text((50, 180), "Reverse Standoff Voltage")
+        page.insert_text((250, 180), "VRWM")
+        page.insert_text((400, 180), "5 V")
+        # Long note block (>80 chars) containing exactly one query token.
+        note = (
+            "Note: 1. ESD voltage applied between channel pins and ground "
+            "per IEC 61000-4-2 using the contact discharge method under "
+            "ambient conditions as specified in the qualification report."
+        )
+        page.insert_textbox(pymupdf.Rect(50, 300, 550, 400), note)
+        p = tmp_path / "sp05.pdf"
+        doc.save(str(p))
+        doc.close()
+        import pathlib
+
+        return str(pathlib.Path(p).resolve())
+
+    def test_single_doc_keeps_matching_table_block(
+        self, datasheet_pdf, isolated_server
+    ):
+        result = pdf_search(
+            datasheet_pdf, self.QUERY, mode="keyword", excerpt_style="paragraph"
+        )
+        assert result["matches"], result
+        m = result["matches"][0]
+        ex = m["excerpt"].lower()
+        assert "reverse standoff voltage" in ex
+        assert not ex.startswith("note:")
+        # Geometry stays on the true hit block, not the note.
+        assert "bbox" in m
+
+    def test_corpus_keeps_matching_table_block(self, datasheet_pdf, isolated_server):
+        result = pdf_corpus_search(
+            [datasheet_pdf], self.QUERY, mode="keyword", excerpt_style="paragraph"
+        )
+        assert result["matches"], result
+        ex = result["matches"][0]["excerpt"].lower()
+        assert "reverse standoff voltage" in ex
+        assert not ex.startswith("note:")
+
+    def test_retry_still_upgrades_on_equal_coverage(self, tmp_path, isolated_server):
+        """The min-chars retry keeps working when the substantive block
+        matches at least as well (existing caption-skip design)."""
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((50, 60), "Budget overview")  # short heading, 1 token
+        page.insert_textbox(
+            pymupdf.Rect(50, 150, 550, 250),
+            "The quarterly budget increased across departments this year, "
+            "with detailed allocations described in the appendix tables.",
+        )
+        p = tmp_path / "prose.pdf"
+        doc.save(str(p))
+        doc.close()
+        import pathlib
+
+        path = str(pathlib.Path(p).resolve())
+        result = pdf_search(path, "budget", mode="keyword", excerpt_style="paragraph")
+        assert result["matches"], result
+        assert result["matches"][0]["excerpt"].startswith("The quarterly")
+
+
+class TestCorpusKeywordOrFallbackScope:
+    """The OR fallback rescues a keyword-only search that found nothing.
+    In hybrid mode the semantic arm already covers that gap, so injecting
+    loose single-term matches into RRF only dilutes a good ranking --
+    measured on two corpora, hybrid regressed when it fired there."""
+
+    def test_keyword_mode_rescues_a_question_shaped_query(
+        self, corpus_dir, isolated_server
+    ):
+        result = pdf_corpus_search(
+            str(corpus_dir),
+            "what does the budget say about unicorn provisioning",
+            mode="keyword",
+        )
+        assert "error" not in result
+        assert result["total_matches"] >= 1, (
+            "keyword-only mode should fall back to OR when the strict"
+            " AND query matches nothing anywhere"
+        )
+
+    def test_auto_mode_does_not_use_the_keyword_or_fallback(
+        self, corpus_dir, isolated_server
+    ):
+        from pdf_mcp.server import _corpus_keyword_rankings
+
+        files = sorted(str(p) for p in corpus_dir.glob("*.pdf"))
+        pdf_corpus_warm(files)
+        query = "what does the budget say about unicorn provisioning"
+
+        rescued, _, _ = _corpus_keyword_rankings(
+            files, query, 10, 200, allow_or_fallback=True
+        )
+        strict, _, _ = _corpus_keyword_rankings(
+            files, query, 10, 200, allow_or_fallback=False
+        )
+        assert rescued, "precondition: the fallback finds something"
+        assert not strict, "strict mode must stay empty for the hybrid arm"
+
+
+class TestCorpusSearchExcerptStyleDefault:
+    """pdf_search moved its default from "snippet" to "paragraph" after
+    benchmarking 97% vs 80% answer containment. pdf_corpus_search was built
+    later and kept the legacy default, so the same query against the same
+    page returned the answer sentence from one tool and a fixed-width window
+    over a table header from the other."""
+
+    def test_default_excerpt_style_is_paragraph(self, corpus_dir, isolated_server):
+        result = pdf_corpus_search(str(corpus_dir), "budget")
+        assert "error" not in result
+        assert result["excerpt_style"] == "paragraph"
+
+    def test_default_matches_carry_block_geometry(self, corpus_dir, isolated_server):
+        """Paragraph mode adds bbox/clip; snippet mode does not. Asserting on
+        the geometry proves the paragraph path actually ran, rather than the
+        echoed field alone."""
+        result = pdf_corpus_search(str(corpus_dir), "budget")
+        assert result["matches"], "precondition: query returned matches"
+        assert any(
+            "bbox" in m for m in result["matches"]
+        ), "paragraph mode should attach block geometry to at least one match"
+
+    def test_snippet_remains_available_explicitly(self, corpus_dir, isolated_server):
+        result = pdf_corpus_search(str(corpus_dir), "budget", excerpt_style="snippet")
+        assert result["excerpt_style"] == "snippet"
+
+
+class TestHybridDocMatchCounts:
+    """In hybrid mode doc_match_counts came from the keyword arm alone, so a
+    question-shaped query (which the keyword arm cannot match, by design)
+    reported {} even when the semantic arm found pages in several documents.
+    That is the one signal telling an agent "other documents also matched --
+    go ask them separately", and it was blank exactly when it mattered."""
+
+    def test_keyword_counts_survive_when_semantic_adds_nothing(self):
+        from pdf_mcp.server import _merge_doc_match_counts
+
+        assert _merge_doc_match_counts({"a.pdf": 3}, []) == {"a.pdf": 3}
+
+    def test_semantic_only_docs_are_reported(self):
+        from pdf_mcp.server import _merge_doc_match_counts
+
+        # The bug: keyword matched nothing, so the caller saw {}.
+        out = _merge_doc_match_counts({}, [("a.pdf", 1), ("a.pdf", 7), ("b.pdf", 2)])
+        assert out == {"a.pdf": 2, "b.pdf": 1}
+
+    def test_overlapping_arms_do_not_double_count(self):
+        from pdf_mcp.server import _merge_doc_match_counts
+
+        # Both arms saw the same document; the count is "at least this many
+        # pages matched", not the sum of two views of the same pages.
+        out = _merge_doc_match_counts({"a.pdf": 5}, [("a.pdf", 1), ("a.pdf", 2)])
+        assert out == {"a.pdf": 5}
+
+    def test_semantic_wins_when_it_saw_more_pages(self):
+        from pdf_mcp.server import _merge_doc_match_counts
+
+        out = _merge_doc_match_counts({"a.pdf": 1}, [("a.pdf", 1), ("a.pdf", 2)])
+        assert out == {"a.pdf": 2}
+
+
+class TestCorpusCoverageScoring:
+    """Cross-document relevance for keyword fusion.
+
+    Every document's rank-1 page ties at 1/(k+0) in RRF, so whatever
+    breaks that tie IS the cross-document ranking. It used to be filename
+    order, which scored 0.000 doc-NDCG on the described-query class.
+    """
+
+    def test_query_terms_drop_function_words(self):
+        terms = server._corpus_query_terms(
+            "does normalizing layer inputs converge at equal accuracy"
+        )
+        assert "normalizing" in terms and "accuracy" in terms
+        # 3-char tokens are in nearly every document and would flatten
+        # the signal rather than sharpen it.
+        assert "at" not in terms and "does" in terms
+
+    def test_query_terms_are_lowercased_and_split_on_punctuation(self):
+        assert server._corpus_query_terms("Batch-Normalization, ReLU!") == {
+            "batch",
+            "normalization",
+            "relu",
+        }
+
+    def test_rarer_terms_outweigh_ubiquitous_ones(self):
+        # "transformer" is in every document; "grokking" in one. The
+        # document with the single distinctive term must outrank the
+        # documents with the common one.
+        covered = {
+            "a.pdf": {"transformer"},
+            "b.pdf": {"transformer"},
+            "c.pdf": {"transformer"},
+            "d.pdf": {"grokking"},
+        }
+        scores = server._corpus_coverage_scores(covered)
+        assert scores["d.pdf"] > scores["a.pdf"]
+
+    def test_more_covered_terms_scores_higher_all_else_equal(self):
+        covered = {"a.pdf": {"alpha", "bravo"}, "b.pdf": {"alpha"}}
+        scores = server._corpus_coverage_scores(covered)
+        assert scores["a.pdf"] > scores["b.pdf"]
+
+    def test_document_covering_nothing_scores_zero(self):
+        scores = server._corpus_coverage_scores({"a.pdf": set(), "b.pdf": {"x"}})
+        assert scores["a.pdf"] == 0.0
+        assert scores["b.pdf"] > 0.0
+
+    def test_empty_input(self):
+        assert server._corpus_coverage_scores({}) == {}
+
+    def test_scores_do_not_depend_on_document_names(self):
+        # The property both shipped bugs violated.
+        covered = {"a.pdf": {"x", "y"}, "m.pdf": {"x"}, "z.pdf": {"y", "q"}}
+        renamed = {"z9.pdf": {"x", "y"}, "m9.pdf": {"x"}, "a9.pdf": {"y", "q"}}
+        s1 = server._corpus_coverage_scores(covered)
+        s2 = server._corpus_coverage_scores(renamed)
+        assert s1["a.pdf"] == s2["z9.pdf"]
+        assert s1["z.pdf"] == s2["a9.pdf"]
+
+    def test_covered_terms_returns_empty_without_cache(self, monkeypatch):
+        monkeypatch.setattr(server, "cache", None)
+        assert server._doc_covered_terms("x.pdf", [1], {"alpha"}) == set()
+
+    def test_covered_terms_survives_a_cache_error(self, monkeypatch):
+        class Boom:
+            def get_pages_text(self, *a, **k):
+                raise RuntimeError("cache unavailable")
+
+        monkeypatch.setattr(server, "cache", Boom())
+        assert server._doc_covered_terms("x.pdf", [1], {"alpha"}) == set()
+
+
+class TestHTTPTransportEntryPoint:
+    """`main_http()` is the remote entry point; it must fail closed."""
+
+    def test_missing_token_refuses_to_start(self, monkeypatch):
+        monkeypatch.delenv("PDF_MCP_AUTH_TOKEN", raising=False)
+        called = []
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: called.append(kw))
+
+        with pytest.raises(SystemExit) as exc:
+            server.main_http()
+
+        assert "PDF_MCP_AUTH_TOKEN" in str(exc.value)
+        assert called == []
+
+    def test_empty_token_refuses_to_start(self, monkeypatch):
+        monkeypatch.setenv("PDF_MCP_AUTH_TOKEN", "   ")
+        called = []
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: called.append(kw))
+
+        with pytest.raises(SystemExit):
+            server.main_http()
+
+        assert called == []
+
+    def test_token_is_wired_into_a_static_verifier(self, monkeypatch):
+        from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+
+        monkeypatch.setenv("PDF_MCP_AUTH_TOKEN", "s3cret")
+        monkeypatch.setenv("PDF_MCP_ALLOW_ANY_PATH", "1")
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: None)
+        monkeypatch.setattr(server.mcp, "auth", None, raising=False)
+
+        server.main_http()
+
+        assert isinstance(server.mcp.auth, StaticTokenVerifier)
+        assert "s3cret" in server.mcp.auth.tokens
+        assert server.mcp.auth.tokens["s3cret"]["client_id"] == "pdf-mcp"
+
+    def test_mcp_route_rejects_missing_or_wrong_token(self, tmp_path, monkeypatch):
+        """Proves enforcement over HTTP, not just that `mcp.auth` got set.
+
+        `test_token_is_wired_into_a_static_verifier` only proves the
+        assignment happened; it would still pass if a future fastmcp
+        stopped consuming `self.auth`. This hits the real ASGI app so a
+        broken wiring shows up as a non-401 response instead.
+        """
+        from starlette.testclient import TestClient
+
+        monkeypatch.setenv("PDF_MCP_AUTH_TOKEN", "s3cret")
+        monkeypatch.setattr(server, "pdf_config", self._allowlisted_config(tmp_path))
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: None)
+
+        server.main_http()
+
+        app = server.mcp.http_app(path="/mcp")
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1"},
+            },
+        }
+        headers = {"Accept": "application/json, text/event-stream"}
+        with TestClient(app) as client:
+            no_auth = client.post("/mcp", json=body, headers=headers)
+            wrong_auth = client.post(
+                "/mcp",
+                json=body,
+                headers={**headers, "Authorization": "Bearer wrong-token"},
+            )
+
+        assert no_auth.status_code == 401
+        assert wrong_auth.status_code == 401
+
+    def test_defaults_bind_loopback(self, monkeypatch):
+        monkeypatch.setenv("PDF_MCP_AUTH_TOKEN", "s3cret")
+        monkeypatch.setenv("PDF_MCP_ALLOW_ANY_PATH", "1")
+        for var in ("PDF_MCP_HTTP_HOST", "PDF_MCP_HTTP_PORT", "PDF_MCP_HTTP_PATH"):
+            monkeypatch.delenv(var, raising=False)
+        captured = {}
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: captured.update(kw))
+
+        server.main_http()
+
+        assert captured == {
+            "transport": "http",
+            "host": "127.0.0.1",
+            "port": 8000,
+            "path": "/mcp",
+        }
+
+    def test_host_port_path_come_from_env(self, monkeypatch):
+        monkeypatch.setenv("PDF_MCP_AUTH_TOKEN", "s3cret")
+        monkeypatch.setenv("PDF_MCP_ALLOW_ANY_PATH", "1")
+        monkeypatch.setenv("PDF_MCP_HTTP_HOST", "0.0.0.0")
+        monkeypatch.setenv("PDF_MCP_HTTP_PORT", "9123")
+        monkeypatch.setenv("PDF_MCP_HTTP_PATH", "/pdf")
+        captured = {}
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: captured.update(kw))
+
+        server.main_http()
+
+        assert captured["host"] == "0.0.0.0"
+        assert captured["port"] == 9123
+        assert captured["path"] == "/pdf"
+
+    def test_stdio_main_is_untouched(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: captured.update(kw))
+        server.main()
+        assert captured == {"transport": "stdio"}
+
+    def _allowlisted_config(self, tmp_path):
+        cfg = tmp_path / "config.toml"
+        cfg.write_text('[paths]\nallow = ["/data/pdfs/**"]\n')
+        from pdf_mcp.config import PDFConfig
+
+        return PDFConfig(config_path=cfg)
+
+    def test_missing_allowlist_refuses_to_start(self, tmp_path, monkeypatch):
+        from pdf_mcp.config import PDFConfig
+
+        monkeypatch.setenv("PDF_MCP_AUTH_TOKEN", "s3cret")
+        monkeypatch.delenv("PDF_MCP_ALLOW_ANY_PATH", raising=False)
+        monkeypatch.setattr(
+            server, "pdf_config", PDFConfig(config_path=tmp_path / "none.toml")
+        )
+        called = []
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: called.append(kw))
+
+        with pytest.raises(SystemExit) as exc:
+            server.main_http()
+
+        assert "allow" in str(exc.value).lower()
+        assert str(tmp_path / "none.toml") in str(exc.value)
+        assert called == []
+
+    def test_allowlist_present_starts(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PDF_MCP_AUTH_TOKEN", "s3cret")
+        monkeypatch.delenv("PDF_MCP_ALLOW_ANY_PATH", raising=False)
+        monkeypatch.setattr(server, "pdf_config", self._allowlisted_config(tmp_path))
+        captured = {}
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: captured.update(kw))
+
+        server.main_http()
+
+        assert captured["transport"] == "http"
+
+    def test_override_env_allows_start_without_allowlist(self, tmp_path, monkeypatch):
+        from pdf_mcp.config import PDFConfig
+
+        monkeypatch.setenv("PDF_MCP_AUTH_TOKEN", "s3cret")
+        monkeypatch.setenv("PDF_MCP_ALLOW_ANY_PATH", "1")
+        monkeypatch.setattr(
+            server, "pdf_config", PDFConfig(config_path=tmp_path / "none.toml")
+        )
+        captured = {}
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: captured.update(kw))
+
+        server.main_http()
+
+        assert captured["transport"] == "http"
+
+    def test_token_check_runs_before_allowlist_check(self, tmp_path, monkeypatch):
+        from pdf_mcp.config import PDFConfig
+
+        monkeypatch.delenv("PDF_MCP_AUTH_TOKEN", raising=False)
+        monkeypatch.setattr(
+            server, "pdf_config", PDFConfig(config_path=tmp_path / "none.toml")
+        )
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: None)
+
+        with pytest.raises(SystemExit) as exc:
+            server.main_http()
+
+        assert "PDF_MCP_AUTH_TOKEN" in str(exc.value)
+
+    def test_stdio_main_ignores_the_allowlist_guard(self, tmp_path, monkeypatch):
+        from pdf_mcp.config import PDFConfig
+
+        monkeypatch.setattr(
+            server, "pdf_config", PDFConfig(config_path=tmp_path / "none.toml")
+        )
+        captured = {}
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: captured.update(kw))
+
+        server.main()
+
+        assert captured == {"transport": "stdio"}
+
+    def test_health_route_is_registered_and_unauthenticated(
+        self, tmp_path, monkeypatch
+    ):
+        from starlette.testclient import TestClient
+
+        monkeypatch.setenv("PDF_MCP_AUTH_TOKEN", "s3cret")
+        monkeypatch.setattr(server, "pdf_config", self._allowlisted_config(tmp_path))
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: None)
+
+        server.main_http()
+
+        app = server.mcp.http_app(path="/mcp")
+        with TestClient(app) as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["version"] == server.__version__

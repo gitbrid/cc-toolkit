@@ -1,0 +1,72 @@
+{
+  "skill_name": "the-learning-skill",
+  "evals": [
+    {
+      "id": 0,
+      "name": "concurrent-transactions",
+      "prompt": "I want to actually understand how databases handle concurrent transactions. I keep reading about isolation levels — read committed, repeatable read, snapshot isolation, serializable — but it never sticks. I can't explain the differences a week later, even though I work with Postgres every day. I'm a backend engineer, comfortable writing SQL but I've never built a database engine. Help me really learn this — I want to come away able to explain it cleanly and still remember it next month. I have about an hour today and 20 min/day after that.",
+      "expected_output": "A goal-clarifying response (or confirming defaults), a Feynman-style or first-principles explanation that starts with what isolation actually IS rather than just listing the levels, an active-recall component (asks the user to explain or apply something), durable artifacts saved to disk including a markdown summary/cheat sheet AND flashcards (HTML or Anki TSV) AND a spaced-repetition schedule, and a clear next step for the user.",
+      "files": [],
+      "expectations": [
+        "Response quickly establishes or assumes a learning goal (understand-it / use-it / pass-it / etc.) rather than diving into a wall of text",
+        "Response uses an active-recall, Feynman, or first-principles framing — does not just lecture passively",
+        "Response asks the user to produce something (explain in own words, predict, or answer a question) AND signals that it is waiting for the user, rather than asking and immediately self-answering",
+        "Response saves a markdown notes/cheat-sheet file with concrete useful content on isolation levels (mentions at least three of: dirty read, non-repeatable read, phantom read, lost update, write skew)",
+        "Response generates flashcards or an Anki deck or an HTML flashcard app file with at least 5 cards covering the topic",
+        "Response generates a spaced-repetition schedule (markdown or .ics file or both) targeting the topic",
+        "Response calls out the right reference scripts/files (e.g. uses generate_flashcards_html.py / generate_schedule.py / generate_anki_deck.py from the skill)",
+        "Response explicitly tells the user when/how to come back for the next session"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "raft-interview-prep",
+      "prompt": "I have a software architecture interview at a fintech next Tuesday and they told me to be ready on distributed consensus — specifically Raft. I get the high-level idea (leader, log replication, voting) but I always freeze when I'm asked to walk through edge cases — network partitions, leader failures during log replication, what happens to in-flight commits, how log compaction works. I'm a senior backend engineer, 8 years in, but I've never operated a Raft system in production. I have maybe 6 hours total to prep over the next 5 days. Help me get sharp.",
+      "expected_output": "Recognition that this is exam/interview prep with a clear deadline, a brief diagnostic that probes the user's stated weak spots (network partitions, leader failures, etc.) rather than retreating to safer basics, a 5-day plan that fits ~6 hours total, generation of a quiz HTML file with scenario-based questions, and explicit running of an active-recall session on the user's weak spots.",
+      "files": [],
+      "expectations": [
+        "Response identifies the goal as exam/interview prep (pass-it framing) with a 5-day deadline rather than treating it as open-ended understanding",
+        "Response includes diagnostic questions that target the user's stated weak spots (network partitions, leader failures, log replication edge cases) — not just basic 'what is Raft' questions",
+        "Response includes scenario-based questions or stress-tests rather than only conceptual questions",
+        "Response saves a quiz HTML file (using generate_quiz_html.py) or equivalent quiz artifact with at least 5 scenario questions",
+        "Response saves a markdown study plan/cheat sheet covering the topics mentioned (leader election, log replication, partition handling, log compaction)",
+        "Response produces a time-budgeted plan that fits 6 hours over 5 days (does not propose a 40-hour curriculum)",
+        "Response asks the user to do something active right now — answer a diagnostic question, explain something — rather than only delivering a plan",
+        "Response signals it is waiting for the user's input rather than answering its own questions"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "mandarin-memorization",
+      "prompt": "I'm teaching myself basic Mandarin Chinese and I'm trying to memorize the 100 most common characters so I can recognize them in context. I just keep forgetting them between sessions. I have about 30 minutes a day, every day, for as long as it takes. I'd love a real system — not just a list to stare at. Help me make this stick.",
+      "expected_output": "A memorization-focused approach (not 'understand it'), generation of an Anki TSV deck or HTML flashcards covering at least 20 high-frequency characters (with character / pinyin / meaning), a spaced-repetition schedule using the skill's generate_schedule.py, encoding tips beyond rote (mnemonics, radicals, chunking), and a daily 30-min protocol the user can follow.",
+      "files": [],
+      "expectations": [
+        "Response treats this as a remember-it / memorization goal, not a conceptual-understanding goal",
+        "Response generates an Anki deck (TSV) or HTML flashcards file with at least 20 actual cards (not just placeholder text), each containing the character, pinyin, and meaning at minimum",
+        "Response generates a spaced-repetition schedule (markdown and/or .ics)",
+        "Response provides memory-encoding strategies beyond rote review (radicals, mnemonics, chunking by category, or similar) — not just 'review the list'",
+        "Response provides a concrete daily 30-min protocol the user can follow (e.g. structured into review + new material + recall test)",
+        "Response either uses the actual generation scripts (generate_anki_deck.py, generate_flashcards_html.py, generate_schedule.py) or creates equivalent artifacts manually",
+        "Response acknowledges the user has indefinite time horizon (rather than imposing an artificial deadline)"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "rust-cli-roadmap",
+      "prompt": "I want to learn enough Rust over the next 8 weeks to ship a small CLI tool I've been wanting to build — a markdown linter for my company's docs style guide. I have about 5 hours per week. I have a lot of Python and TypeScript experience (12 years), but Rust ownership has stumped me twice when I've tried it before — I bounced off it both times. Make me a real plan, and let's get started today.",
+      "expected_output": "An 8-week roadmap with stages, checkpoints, and concrete resources, recognition that ownership is a known weak spot (and addressing it head-on early), a deliberate-practice element rather than just reading lists, the user being asked to start today (not 'when ready'), and artifacts saved to disk (the roadmap markdown at minimum, ideally also a spaced-repetition schedule for ownership concepts).",
+      "files": [],
+      "expectations": [
+        "Response produces an 8-week roadmap in markdown form with clear stages and checkpoints (not just 'study this for a while, then move on')",
+        "Response calibrates the plan to ~5 hours/week (40 hours total), not a 100-hour fantasy plan",
+        "Response treats ownership as a specifically-flagged weak point and addresses it with deliberate practice early (not 'read chapter 4 and you'll be fine')",
+        "Response includes specific named resources (books, courses, doc sections, exercises like Rustlings or Exercism) — not just 'find a Rust tutorial'",
+        "Response ties checkpoints to concrete artifacts (working code, exercises completed, etc.) rather than 'feel comfortable with X'",
+        "Response saves the roadmap to a markdown file on disk",
+        "Response starts the first session today rather than only handing over a plan",
+        "Response asks the user to engage actively (a starting question, an exercise, or running through a concept) rather than ending with 'good luck'"
+      ]
+    }
+  ]
+}

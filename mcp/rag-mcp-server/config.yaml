@@ -1,0 +1,47 @@
+# RAG MCP Server Configuration
+# Copy this file to customize settings
+
+# Embedding model — multilingual for Spanish + English support
+# Alternatives: "all-MiniLM-L6-v2" (faster, English-only)
+embedding_model: "paraphrase-multilingual-MiniLM-L12-v2"
+
+# Chunk settings (characters)
+chunk_size: 1500
+chunk_overlap: 300
+
+# Default number of results per query
+top_k: 5
+
+# OCR languages (requires Tesseract installed)
+# Format: "lang1+lang2" — see: tesseract --list-langs
+ocr_languages: "spa+eng"
+
+# Maximum file size to index (MB) — skips larger files
+max_file_size_mb: 50
+
+# Data storage directory (embeddings, manifests)
+data_dir: "~/.rag-mcp-server/data"
+
+# Supported file extensions for indexing
+supported_extensions:
+  - ".pdf"
+  - ".md"
+  - ".txt"
+  - ".py"
+  - ".js"
+  - ".ts"
+  - ".jsx"
+  - ".tsx"
+  - ".rs"
+  - ".toml"
+  - ".json"
+  - ".yaml"
+  - ".yml"
+  - ".html"
+  - ".css"
+  - ".sol"
+  - ".go"
+  - ".java"
+  - ".cpp"
+  - ".c"
+  - ".h"

@@ -1,0 +1,809 @@
+# tests/test_url_fetcher.py
+"""Tests for pdf_mcp.url_fetcher module."""
+
+import socket
+import tempfile
+from pathlib import Path
+from unittest.mock import Mock, patch, MagicMock
+
+import pytest
+
+from pdf_mcp.config import PDFConfig
+from pdf_mcp.url_fetcher import (
+    PDFValidationError,
+    URLFetcher,
+    _validate_pdf_content,
+)
+
+
+@pytest.fixture
+def url_fetcher(temp_cache_dir):
+    """Create URLFetcher with temp directory."""
+    return URLFetcher(cache_dir=temp_cache_dir / "downloads")
+
+
+@pytest.fixture(scope="session")
+def valid_pdf_bytes():
+    """Valid PDF content (minimal single-page document)."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    doc.new_page(width=100, height=100)
+    doc[0].insert_text((10, 10), "Test", fontsize=8)
+    buf = doc.tobytes()
+    doc.close()
+    return buf
+
+
+def _mock_stream_response(
+    content, headers=None, is_redirect=False, redirect_url=None, location=None
+):
+    """Create a mock streaming response for httpx.Client.stream().
+
+    Mirrors real httpx on a redirect: it exposes both a ``Location`` header
+    and a computed ``next_request.url``. ``location`` sets the raw header
+    (used to model relative redirects); ``redirect_url`` sets
+    ``next_request.url`` (used to model httpx resolving that Location against
+    the request URL, which our pinning path rewrites to the IP). When only
+    ``redirect_url`` is given, it doubles as the header (the common
+    absolute-redirect case).
+    """
+    if headers is None:
+        headers = {}
+    header_location = location if location is not None else redirect_url
+    if is_redirect and header_location is not None:
+        headers = {**headers, "location": header_location}
+    mock_response = MagicMock()
+    mock_response.headers = headers
+    mock_response.url = "https://example.com/test.pdf"
+    mock_response.is_redirect = is_redirect
+    mock_response.raise_for_status = Mock()
+    mock_response.iter_bytes = Mock(return_value=iter([content]))
+    mock_response.__enter__ = Mock(return_value=mock_response)
+    mock_response.__exit__ = Mock(return_value=False)
+    if is_redirect and (redirect_url or location):
+        mock_next_request = MagicMock()
+        mock_next_request.url = redirect_url if redirect_url is not None else location
+        mock_response.next_request = mock_next_request
+    return mock_response
+
+
+class TestFetch:
+    """Tests for URLFetcher.fetch() method."""
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_successful_download(self, mock_validate, url_fetcher, valid_pdf_bytes):
+        """Successful download saves file and returns path."""
+        url = "https://example.com/test.pdf"
+
+        mock_response = _mock_stream_response(
+            valid_pdf_bytes, {"content-type": "application/pdf"}
+        )
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("93.184.216.34", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.return_value = mock_response
+
+                result = url_fetcher.fetch(url)
+
+        assert result.exists()
+        assert result.stat().st_size > 0
+        content = result.read_bytes()
+        assert content.startswith(b"%PDF-")
+        # _validate_url_no_dns called twice: once pre-loop + once inside loop
+        assert mock_validate.call_count >= 1
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_invalid_content_raises_valueerror(self, mock_validate, url_fetcher):
+        """Non-PDF content raises ValueError."""
+        url = "https://example.com/notapdf.html"
+
+        mock_response = _mock_stream_response(
+            b"<html>Not a PDF</html>", {"content-type": "text/html"}
+        )
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.5", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.return_value = mock_response
+
+                with pytest.raises(ValueError, match="not.*PDF|content[- ]type"):
+                    url_fetcher.fetch(url)
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_force_refresh_bypasses_cache(
+        self, mock_validate, url_fetcher, valid_pdf_bytes
+    ):
+        """force_refresh=True re-downloads even if cached."""
+        url = "https://example.com/refresh.pdf"
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.5", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                # Use side_effect to return a fresh mock per call
+                mock_client.return_value.stream.side_effect = [
+                    _mock_stream_response(
+                        valid_pdf_bytes, {"content-type": "application/pdf"}
+                    ),
+                    _mock_stream_response(
+                        valid_pdf_bytes, {"content-type": "application/pdf"}
+                    ),
+                ]
+
+                # First fetch
+                url_fetcher.fetch(url)
+
+                # Second fetch with force_refresh - should stream again
+                url_fetcher.fetch(url, force_refresh=True)
+
+                # httpx.Client().stream should be called twice
+                assert mock_client.return_value.stream.call_count == 2
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_fetch_cache_hit(self, mock_validate, url_fetcher, valid_pdf_bytes):
+        """Second fetch without force_refresh returns cached path without streaming."""
+        url = "https://example.com/cached.pdf"
+
+        mock_response = _mock_stream_response(
+            valid_pdf_bytes, {"content-type": "application/pdf"}
+        )
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.5", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.return_value = mock_response
+
+                # First fetch - downloads
+                path1 = url_fetcher.fetch(url)
+
+                # Second fetch - should hit cache
+                path2 = url_fetcher.fetch(url)
+
+        assert path1 == path2
+        assert path2.exists()
+        assert mock_client.return_value.stream.call_count == 1
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_pdf_url_with_html_content_rejected(self, mock_validate, url_fetcher):
+        """URL ending in .pdf but returning HTML content is rejected."""
+        url = "https://example.com/malicious.pdf"
+
+        mock_response = _mock_stream_response(
+            b"<html><body>Not a PDF</body></html>", {"content-type": "text/html"}
+        )
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.5", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.return_value = mock_response
+
+                with pytest.raises(ValueError, match="not.*PDF|content[- ]type"):
+                    url_fetcher.fetch(url)
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_pdf_url_redirect_to_html_rejected(self, mock_validate, url_fetcher):
+        """Redirect from .pdf URL to HTML content is rejected."""
+        url = "https://example.com/document.pdf"
+        redirect_url = "https://example.com/login.html"
+
+        redirect_response = _mock_stream_response(
+            b"",
+            is_redirect=True,
+            redirect_url=redirect_url,
+        )
+        final_response = _mock_stream_response(
+            b"<html><body>Please login</body></html>", {"content-type": "text/html"}
+        )
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.5", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.side_effect = [
+                    redirect_response,
+                    final_response,
+                ]
+
+                with pytest.raises(ValueError, match="not.*PDF|content[- ]type"):
+                    url_fetcher.fetch(url)
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_pdf_url_wrong_content_type_but_valid_magic_bytes_accepted(
+        self, mock_validate, url_fetcher, valid_pdf_bytes
+    ):
+        """URL with non-PDF Content-Type but valid %PDF magic bytes is accepted."""
+        url = "https://example.com/paper.pdf"
+
+        mock_response = _mock_stream_response(
+            valid_pdf_bytes, {"content-type": "application/octet-stream"}
+        )
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.5", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.return_value = mock_response
+
+                result = url_fetcher.fetch(url)
+
+        assert result.exists()
+        assert result.read_bytes().startswith(b"%PDF-")
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_pdf_url_no_content_type_but_valid_magic_bytes_accepted(
+        self, mock_validate, url_fetcher, valid_pdf_bytes
+    ):
+        """URL with no Content-Type header but valid %PDF magic bytes is accepted."""
+        url = "https://example.com/download?id=123"
+
+        mock_response = _mock_stream_response(valid_pdf_bytes, {})
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.5", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.return_value = mock_response
+
+                result = url_fetcher.fetch(url)
+
+        assert result.exists()
+        assert result.read_bytes().startswith(b"%PDF-")
+
+
+class TestGetCacheFilename:
+    """Tests for URLFetcher._get_cache_filename() method."""
+
+    def test_pdf_url_extracts_name(self, url_fetcher):
+        """PDF URL extracts original filename."""
+        url = "https://example.com/path/document.pdf"
+        filename = url_fetcher._get_cache_filename(url)
+
+        assert filename.endswith("_document.pdf")
+        assert len(filename) > len("document.pdf")  # Has hash prefix
+
+    def test_non_pdf_url_uses_hash(self, url_fetcher):
+        """Non-PDF URL uses hash-based filename."""
+        url = "https://example.com/api/download?id=123"
+        filename = url_fetcher._get_cache_filename(url)
+
+        assert filename.endswith(".pdf")
+        assert "_" not in filename
+
+    def test_special_chars_sanitized(self, url_fetcher):
+        """Special characters are removed from filename."""
+        url = "https://example.com/path/my%20doc!@#$.pdf"
+        filename = url_fetcher._get_cache_filename(url)
+
+        # Should only contain alphanumeric, dots, underscores, hyphens
+        base = filename.split("_", 1)[-1] if "_" in filename else filename
+        assert all(c.isalnum() or c in "._-" for c in base)
+
+    def test_deterministic_hash(self, url_fetcher):
+        """Same URL produces same filename."""
+        url = "https://example.com/test.pdf"
+        filename1 = url_fetcher._get_cache_filename(url)
+        filename2 = url_fetcher._get_cache_filename(url)
+
+        assert filename1 == filename2
+
+
+class TestGetLocalPath:
+    """Tests for URLFetcher.get_local_path() method."""
+
+    def test_cache_miss_returns_none(self, url_fetcher):
+        """Uncached URL returns None."""
+        result = url_fetcher.get_local_path("https://example.com/uncached.pdf")
+        assert result is None
+
+    def test_memory_cache_hit(self, url_fetcher, temp_cache_dir):
+        """URL in memory cache returns path."""
+        url = "https://example.com/cached.pdf"
+        cached_path = temp_cache_dir / "downloads" / "test.pdf"
+        cached_path.parent.mkdir(parents=True, exist_ok=True)
+        cached_path.write_bytes(b"%PDF-1.4")
+
+        url_fetcher._url_to_path[url] = cached_path
+
+        result = url_fetcher.get_local_path(url)
+        assert result == cached_path
+
+    def test_stale_memory_cache_returns_none(self, url_fetcher, temp_cache_dir):
+        """Memory cache with deleted file returns None."""
+        url = "https://example.com/deleted.pdf"
+        deleted_path = temp_cache_dir / "downloads" / "deleted.pdf"
+
+        url_fetcher._url_to_path[url] = deleted_path
+
+        result = url_fetcher.get_local_path(url)
+        assert result is None
+
+    def test_disk_cache_discovery(self, url_fetcher):
+        """File on disk but not in memory is discovered."""
+        url = "https://example.com/ondisk.pdf"
+        filename = url_fetcher._get_cache_filename(url)
+        disk_path = url_fetcher.cache_dir / filename
+        disk_path.write_bytes(b"%PDF-1.4")
+
+        # Not in memory cache
+        assert url not in url_fetcher._url_to_path
+
+        result = url_fetcher.get_local_path(url)
+
+        assert result == disk_path
+        assert url in url_fetcher._url_to_path  # Now in memory
+
+
+class TestClearCache:
+    """Tests for URLFetcher.clear_cache() method."""
+
+    def test_successful_clear_cache(self, url_fetcher):
+        """Successful clear_cache deletes files and returns count."""
+        test_file = url_fetcher.cache_dir / "test.pdf"
+        test_file.write_bytes(b"%PDF")
+
+        count = url_fetcher.clear_cache()
+
+        assert count == 1
+        assert not test_file.exists()
+
+    def test_oserror_handling(self, url_fetcher):
+        """OSError during deletion is handled gracefully."""
+        # Create a file
+        test_file = url_fetcher.cache_dir / "test.pdf"
+        test_file.write_bytes(b"%PDF")
+
+        with patch.object(Path, "unlink", side_effect=OSError("Permission denied")):
+            # Should not raise
+            count = url_fetcher.clear_cache()
+
+        # Count may be 0 since unlink failed
+        assert isinstance(count, int)
+
+
+class TestSSRFProtection:
+    """Tests for SSRF prevention in URL validation."""
+
+    def test_http_scheme_blocked(self, url_fetcher):
+        """http:// URLs are rejected — only https:// is allowed."""
+        with pytest.raises(ValueError, match="Only HTTPS"):
+            url_fetcher._validate_url("http://example.com/test.pdf")
+
+    def test_non_http_scheme_blocked(self, url_fetcher):
+        """Non-HTTPS schemes are blocked."""
+        with pytest.raises(ValueError, match="Only HTTPS"):
+            url_fetcher._validate_url("ftp://example.com/test.pdf")
+
+    def test_private_ip_blocked(self, url_fetcher):
+        """URLs targeting private IPs are blocked."""
+        with patch.object(URLFetcher, "_is_blocked_ip", return_value=True):
+            with pytest.raises(ValueError, match="blocked IP"):
+                url_fetcher._validate_url("https://internal-server.corp/secret.pdf")
+
+    def test_no_hostname_blocked(self, url_fetcher):
+        """URL with no hostname raises ValueError."""
+        with pytest.raises(ValueError, match="Could not extract hostname"):
+            url_fetcher._validate_url("https://")
+
+    def test_public_ip_allowed(self, url_fetcher):
+        """Public IPs pass validation."""
+        with patch.object(URLFetcher, "_is_blocked_ip", return_value=False):
+            url_fetcher._validate_url("https://public-server.com/test.pdf")
+
+    def test_is_blocked_ip_loopback(self):
+        """Loopback addresses are detected as blocked."""
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("127.0.0.1", 0))],
+        ):
+            assert URLFetcher._is_blocked_ip("localhost") is True
+
+    def test_is_blocked_ip_rfc1918(self):
+        """RFC 1918 private addresses are detected as blocked."""
+        for ip in ["10.0.0.1", "172.16.0.1", "192.168.1.1"]:
+            with patch(
+                "socket.getaddrinfo",
+                return_value=[(2, 1, 6, "", (ip, 0))],
+            ):
+                assert URLFetcher._is_blocked_ip("some-host") is True
+
+    def test_is_blocked_ip_link_local(self):
+        """Link-local addresses (cloud metadata) are detected as blocked."""
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("169.254.169.254", 0))],
+        ):
+            assert URLFetcher._is_blocked_ip("metadata.google") is True
+
+    def test_is_blocked_ip_public(self):
+        """Public IPs are not blocked."""
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("93.184.216.34", 0))],
+        ):
+            assert URLFetcher._is_blocked_ip("example.com") is False
+
+    def test_dns_failure_treated_as_blocked(self):
+        """DNS resolution failure is treated as potentially dangerous."""
+        with patch("socket.getaddrinfo", side_effect=OSError("DNS failed")):
+            assert URLFetcher._is_blocked_ip("unknown-host") is True
+
+    def test_localhost_blocked(self, url_fetcher):
+        """localhost, 127.0.0.1, and 0.0.0.0 are blocked via CIDR."""
+        for url in [
+            "https://localhost/secret.pdf",
+            "https://127.0.0.1/secret.pdf",
+            "https://0.0.0.0/secret.pdf",
+        ]:
+            with patch(
+                "socket.getaddrinfo",
+                return_value=[(2, 1, 6, "", ("127.0.0.1", 0))],
+            ):
+                with pytest.raises(ValueError, match="blocked IP"):
+                    url_fetcher._validate_url(url)
+
+
+class TestDefaultCacheDir:
+    """Default download cache must be per-user, not the shared system temp dir."""
+
+    def test_default_is_under_per_user_cache_root(self, tmp_path, monkeypatch):
+        """URLFetcher() with no cache_dir defaults to ~/.cache/pdf-mcp/downloads."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        fetcher = URLFetcher()
+        assert fetcher.cache_dir == tmp_path / ".cache" / "pdf-mcp" / "downloads"
+
+    def test_default_not_the_old_shared_tmp_path(self, tmp_path, monkeypatch):
+        """The default must not be the fixed /tmp/pdf-mcp/downloads path.
+
+        That shared path is what made two local users each spawning pdf-mcp
+        collide (issue #15). The default must instead anchor on the user's
+        home, not tempfile.gettempdir().
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        fetcher = URLFetcher()
+        old_shared = Path(tempfile.gettempdir()) / "pdf-mcp" / "downloads"
+        assert fetcher.cache_dir != old_shared
+        assert fetcher.cache_dir == Path.home() / ".cache" / "pdf-mcp" / "downloads"
+
+    def test_chmod_failure_does_not_crash_init(self, tmp_path):
+        """A foreign-owned cache dir whose chmod fails must not crash __init__.
+
+        On a shared host the dir may already exist owned by another user;
+        the unconditional chmod would raise PermissionError. Init must
+        degrade gracefully instead of crashing the server at startup.
+        """
+        target = tmp_path / "downloads"
+        with patch("pdf_mcp.url_fetcher.os.chmod", side_effect=PermissionError):
+            fetcher = URLFetcher(cache_dir=target)
+        assert fetcher.cache_dir == target
+        assert target.exists()
+
+
+class TestFloorStillApplies:
+    def test_config_wildcard_allow_cannot_bypass_cidr(self, tmp_path):
+        """config url.allow=['*'] cannot bypass the CIDR block floor."""
+        cfg = tmp_path / "config.toml"
+        cfg.write_text('[urls]\nallow = ["*"]\n')
+        config = PDFConfig(config_path=cfg)
+        fetcher = URLFetcher(cache_dir=tmp_path / "cache", config=config)
+
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("10.0.0.1", 0))],
+        ):
+            with pytest.raises(ValueError, match="blocked IP"):
+                fetcher._validate_url("https://internal.example.com/doc.pdf")
+
+
+class TestDownloadSizeLimit:
+    """Tests for download size limits."""
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_content_length_over_limit_rejected(self, mock_validate, url_fetcher):
+        """Content-Length header exceeding limit raises ValueError."""
+        url = "https://example.com/huge.pdf"
+
+        mock_response = _mock_stream_response(
+            b"",
+            {"content-type": "application/pdf", "content-length": "200000000"},
+        )
+        mock_response.is_redirect = False
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.5", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.return_value = mock_response
+
+                with pytest.raises(ValueError, match="too large"):
+                    url_fetcher.fetch(url)
+
+    @patch("pdf_mcp.url_fetcher.MAX_DOWNLOAD_SIZE", 10)
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_streaming_size_exceeded(self, mock_validate, url_fetcher):
+        """Streaming download exceeding MAX_DOWNLOAD_SIZE raises ValueError."""
+        url = "https://example.com/sneaky-large.pdf"
+
+        mock_response = _mock_stream_response(
+            b"x" * 20,
+            {"content-type": "application/pdf"},
+        )
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.5", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.return_value = mock_response
+
+                with pytest.raises(ValueError, match="exceeded maximum size"):
+                    url_fetcher.fetch(url)
+
+
+class TestRedirectSSRFValidation:
+    """Tests for SSRF validation on redirects."""
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_redirect_to_private_ip_blocked(
+        self, mock_validate, url_fetcher, valid_pdf_bytes
+    ):
+        """Redirect to private IP is blocked by _pick_pinned_ip before connecting."""
+        url = "https://public.example.com/paper.pdf"
+        # Must be HTTPS so the scheme check passes; private IP is blocked by
+        # _pick_pinned_ip via DNS resolution.
+        redirect_url = "https://169.254.169.254/latest/meta-data/"
+
+        redirect_response = _mock_stream_response(
+            b"",
+            is_redirect=True,
+            redirect_url=redirect_url,
+        )
+
+        # Return a public IP for the initial URL, and a private/link-local IP
+        # for the redirect target — _pick_pinned_ip must block the redirect.
+        def resolve(hostname, *args, **kwargs):
+            if "169.254" in hostname or hostname == "169.254.169.254":
+                return [(2, 1, 6, "", ("169.254.169.254", 0))]
+            return [(2, 1, 6, "", ("203.0.113.1", 0))]
+
+        with patch("pdf_mcp.url_fetcher.socket.getaddrinfo", side_effect=resolve):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.return_value = redirect_response
+
+                with pytest.raises(ValueError, match="blocked"):
+                    url_fetcher.fetch(url)
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_redirect_to_public_url_allowed(
+        self, mock_validate, url_fetcher, valid_pdf_bytes
+    ):
+        """Redirect to public URL is allowed and followed."""
+        url = "https://example.com/old.pdf"
+        redirect_url = "https://cdn.example.com/new.pdf"
+
+        redirect_response = _mock_stream_response(
+            b"",
+            is_redirect=True,
+            redirect_url=redirect_url,
+        )
+        final_response = _mock_stream_response(
+            valid_pdf_bytes,
+            {"content-type": "application/pdf"},
+        )
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.1", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.side_effect = [
+                    redirect_response,
+                    final_response,
+                ]
+
+                result = url_fetcher.fetch(url)
+
+        assert result.exists()
+        assert result.read_bytes().startswith(b"%PDF-")
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_relative_redirect_preserves_hostname(
+        self, mock_validate, url_fetcher, valid_pdf_bytes
+    ):
+        """A relative Location must resolve against the original hostname.
+
+        Regression for issue #16: the IP-pinning path rewrites each request to
+        the resolved IP, so httpx resolves a relative Location against the IP
+        URL and drops the hostname — the next hop then verifies the TLS cert
+        against the IP and fails. The fix resolves Location against the
+        hostname-based current_url, so every hop pins the real host.
+        """
+        url = "https://arxiv.org/pdf/1706.03762.pdf"
+        # 301 with a RELATIVE Location (the real arxiv case). next_request.url
+        # models httpx's wrong resolution against the pinned-IP request URL.
+        redirect_response = _mock_stream_response(
+            b"",
+            is_redirect=True,
+            location="/pdf/1706.03762",
+            redirect_url="https://203.0.113.9/pdf/1706.03762",
+        )
+        final_response = _mock_stream_response(
+            valid_pdf_bytes, {"content-type": "application/pdf"}
+        )
+
+        seen_hosts: list[str] = []
+
+        def fake_pin(hostname):
+            seen_hosts.append(hostname)
+            return ("203.0.113.1", socket.AF_INET)
+
+        with patch("pdf_mcp.url_fetcher._pick_pinned_ip", side_effect=fake_pin):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.side_effect = [
+                    redirect_response,
+                    final_response,
+                ]
+
+                result = url_fetcher.fetch(url)
+
+        assert result.exists()
+        assert result.read_bytes().startswith(b"%PDF-")
+        # Both hops must pin the real hostname, never the pinned IP literal.
+        assert seen_hosts == ["arxiv.org", "arxiv.org"]
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_redirect_with_no_target_url(self, mock_validate, url_fetcher):
+        """Redirect response with next_request=None raises ValueError."""
+        url = "https://example.com/redirect.pdf"
+
+        redirect_response = _mock_stream_response(b"", is_redirect=True)
+        redirect_response.next_request = None
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.5", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.return_value = redirect_response
+
+                with pytest.raises(ValueError, match="Redirect with no target URL"):
+                    url_fetcher.fetch(url)
+
+    @patch.object(URLFetcher, "_validate_url_no_dns")
+    def test_too_many_redirects_raises(self, mock_validate, url_fetcher):
+        """Exceeding max redirects raises ValueError."""
+        url = "https://example.com/loop.pdf"
+
+        redirect_response = _mock_stream_response(
+            b"",
+            is_redirect=True,
+            redirect_url="https://example.com/loop.pdf",
+        )
+
+        with patch(
+            "pdf_mcp.url_fetcher.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("203.0.113.5", 0))],
+        ):
+            with patch("httpx.Client") as mock_client:
+                mock_client.return_value.__enter__ = Mock(
+                    return_value=mock_client.return_value
+                )
+                mock_client.return_value.__exit__ = Mock(return_value=False)
+                mock_client.return_value.stream.return_value = redirect_response
+
+                with pytest.raises(ValueError, match="Too many redirects"):
+                    url_fetcher.fetch(url)
+
+
+class TestValidatePDFContent:
+    """Direct tests for _validate_pdf_content structural validation."""
+
+    def test_valid_pdf_accepted(self, valid_pdf_bytes):
+        """A well-formed PDF passes validation without raising."""
+        _validate_pdf_content(valid_pdf_bytes, "https://example.com/ok.pdf")
+
+    def test_password_protected_pdf_accepted(self):
+        """A valid password-protected PDF is accepted, not rejected as
+        truncated (regression for #19).
+
+        PDF 1.5+ encrypted documents laid out with compressed object streams
+        read as zero pages until authenticated (``len(doc) == 0``), so a
+        page-count check ahead of the encryption guard false-rejects them as
+        "truncated". ``use_objstms=1`` forces that modern layout, which is the
+        format the bug actually triggers on.
+        """
+        import pymupdf
+
+        doc = pymupdf.open()
+        doc.new_page(width=100, height=100)
+        buf = doc.tobytes(
+            encryption=pymupdf.PDF_ENCRYPT_AES_256,
+            user_pw="secret",
+            use_objstms=1,
+        )
+        doc.close()
+
+        # Sanity-check the fixture reproduces #19's conditions: object-stream
+        # encrypted PDFs report zero pages and require a password.
+        probe = pymupdf.open(stream=buf, filetype="pdf")
+        assert probe.needs_pass and len(probe) == 0
+        probe.close()
+
+        # Must not raise — the document opened, which confirms it is a
+        # structurally valid PDF even though content needs a password.
+        _validate_pdf_content(buf, "https://example.com/enc.pdf")
+
+    def test_garbage_bytes_rejected(self):
+        """Non-PDF bytes that slip past the magic-byte check are rejected."""
+        with pytest.raises(PDFValidationError, match="corrupt"):
+            _validate_pdf_content(b"%PDF-1.4 not really a pdf", "https://x/y.pdf")

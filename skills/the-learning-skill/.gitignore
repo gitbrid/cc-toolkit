@@ -1,0 +1,6 @@
+.claude/
+*.lock
+__pycache__/
+*.pyc
+.DS_Store
+stuff_to_learn/

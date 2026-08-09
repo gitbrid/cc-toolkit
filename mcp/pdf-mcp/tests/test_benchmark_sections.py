@@ -1,0 +1,762 @@
+# tests/test_benchmark_sections.py
+"""Unit tests for scripts/benchmark_sections.py."""
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+
+import benchmark_sections as bs  # noqa: E402
+
+
+class TestStripAnsi:
+    def test_strips_color_codes(self):
+        assert bs._strip_ansi("\x1b[31mred\x1b[0m") == "red"
+
+    def test_passthrough_plain_text(self):
+        assert bs._strip_ansi("plain") == "plain"
+
+
+class TestBoundaryF1:
+    def test_perfect_match_scores_one(self):
+        gold = [bs.Section("A", 1, 5, ""), bs.Section("B", 6, 10, "")]
+        detected = [bs.Section("A", 1, 0, ""), bs.Section("B", 6, 0, "")]
+        m = bs._compute_boundary_f1(gold, detected, tolerance=1)
+        assert m == {
+            "precision": 1.0,
+            "recall": 1.0,
+            "f1": 1.0,
+            "tp": 2,
+            "fp": 0,
+            "fn": 0,
+            "n_gold": 2,
+            "n_detected": 2,
+        }
+
+    def test_off_by_one_within_tolerance(self):
+        gold = [bs.Section("A", 5, 0, "")]
+        detected = [bs.Section("A", 6, 0, "")]
+        m = bs._compute_boundary_f1(gold, detected, tolerance=1)
+        assert m["f1"] == 1.0
+
+    def test_off_by_two_outside_tolerance(self):
+        gold = [bs.Section("A", 5, 0, "")]
+        detected = [bs.Section("A", 7, 0, "")]
+        m = bs._compute_boundary_f1(gold, detected, tolerance=1)
+        assert m["precision"] == 0.0
+        assert m["recall"] == 0.0
+        assert m["f1"] == 0.0
+
+    def test_duplicate_starts_dedupe_to_set(self):
+        # Two TOC entries on the same page count as one gold boundary
+        gold = [bs.Section("A", 5, 0, ""), bs.Section("B", 5, 0, "")]
+        detected = [bs.Section("X", 5, 0, "")]
+        m = bs._compute_boundary_f1(gold, detected, tolerance=0)
+        # n_gold should be 1 (deduped), not 2
+        assert m["n_gold"] == 1
+        assert m["recall"] == 1.0
+        assert m["precision"] == 1.0
+
+    def test_extra_detection_lowers_precision(self):
+        gold = [bs.Section("A", 5, 0, "")]
+        detected = [bs.Section("A", 5, 0, ""), bs.Section("B", 50, 0, "")]
+        m = bs._compute_boundary_f1(gold, detected, tolerance=1)
+        assert m["recall"] == 1.0
+        assert m["precision"] == 0.5
+        assert abs(m["f1"] - (2 * 0.5 * 1.0 / 1.5)) < 1e-9
+
+    def test_missing_detection_lowers_recall(self):
+        gold = [bs.Section("A", 5, 0, ""), bs.Section("B", 50, 0, "")]
+        detected = [bs.Section("A", 5, 0, "")]
+        m = bs._compute_boundary_f1(gold, detected, tolerance=1)
+        assert m["recall"] == 0.5
+        assert m["precision"] == 1.0
+
+    def test_empty_detected_returns_zero_f1(self):
+        gold = [bs.Section("A", 5, 0, "")]
+        m = bs._compute_boundary_f1(gold, [], tolerance=1)
+        assert m == {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "tp": 0,
+            "fp": 0,
+            "fn": 1,
+            "n_gold": 1,
+            "n_detected": 0,
+        }
+
+    def test_empty_gold_returns_zero_recall(self):
+        # Defensive: real callers should never pass empty gold (validated upstream).
+        m = bs._compute_boundary_f1([], [bs.Section("A", 5, 0, "")], tolerance=1)
+        assert m["recall"] == 0.0
+        assert m["precision"] == 0.0
+        assert m["f1"] == 0.0
+
+
+class TestBoilerplateStripping:
+    def test_strips_lines_appearing_on_majority_of_pages(self):
+        pages = [
+            "GPT-3 Technical Report\nPage 1 content here\nFooter line",
+            "GPT-3 Technical Report\nPage 2 content here\nFooter line",
+            "GPT-3 Technical Report\nPage 3 content here\nFooter line",
+            "GPT-3 Technical Report\nPage 4 content here\nFooter line",
+        ]
+        boilerplate = bs._detect_boilerplate(pages, threshold=0.5)
+        assert "GPT-3 Technical Report" in boilerplate
+        assert "Footer line" in boilerplate
+        assert "Page 1 content here" not in boilerplate
+
+    def test_keeps_lines_below_threshold(self):
+        pages = ["Header\nA", "Header\nB", "C\nD"]  # Header is on 2/3 pages
+        boilerplate = bs._detect_boilerplate(pages, threshold=0.7)
+        # 2/3 = 0.667 < 0.7 → not stripped
+        assert "Header" not in boilerplate
+
+    def test_normalizes_whitespace_before_counting(self):
+        # Trailing whitespace should not split otherwise-identical headers
+        pages = ["Header   \nA", "Header\nB", "Header\t\nC"]
+        boilerplate = bs._detect_boilerplate(pages, threshold=0.5)
+        assert "Header" in boilerplate
+
+    def test_strips_paginated_page_numbers_with_changing_digits(self):
+        # "Page 1 of 4", "Page 2 of 4", ... never match each other under exact
+        # equality. The detector must collapse them into a page-number family.
+        pages = [f"Title\nReal content {i}\nPage {i} of 4" for i in range(1, 5)]
+        boilerplate = bs._detect_boilerplate(pages, threshold=0.5)
+        # All four raw forms should land in the boilerplate set
+        assert "Page 1 of 4" in boilerplate
+        assert "Page 2 of 4" in boilerplate
+        assert "Page 4 of 4" in boilerplate
+        # Real content (which also contains a digit) is NOT swept up
+        assert "Real content 1" not in boilerplate
+
+    def test_strips_bare_page_numbers(self):
+        # arxiv-style: bare "1", "2", "3" as page numbers in the footer
+        pages = [f"Body text {i}\n{i}" for i in range(1, 6)]
+        boilerplate = bs._detect_boilerplate(pages, threshold=0.5)
+        assert "1" in boilerplate
+        assert "5" in boilerplate
+        # Body lines vary by digit but each appears only once → not boilerplate
+        assert "Body text 3" not in boilerplate
+
+    def test_does_not_strip_content_with_embedded_digits(self):
+        # Lines like "GPT-3 Technical Report" appear on every page and should
+        # be caught by the EXACT-match path, not the page-number family
+        # (the line is not a pure "Page N" / "N of M" / bare "N" form).
+        pages = ["GPT-3 Technical Report\nA"] * 4
+        boilerplate = bs._detect_boilerplate(pages, threshold=0.5)
+        assert "GPT-3 Technical Report" in boilerplate
+
+    def test_strip_boilerplate_removes_lines(self):
+        text = "Header\nReal content\nFooter"
+        boilerplate = {"Header", "Footer"}
+        assert bs._strip_boilerplate(text, boilerplate) == "Real content"
+
+    def test_strip_boilerplate_idempotent_on_clean_text(self):
+        text = "Real content only"
+        assert bs._strip_boilerplate(text, set()) == "Real content only"
+
+
+class TestTokenize:
+    def test_lowercases_and_strips_punctuation(self):
+        assert bs._tokenize("Hello, World!") == ["hello", "world"]
+
+    def test_splits_on_whitespace(self):
+        assert bs._tokenize("a  b\tc\nd") == ["a", "b", "c", "d"]
+
+    def test_keeps_alphanumeric(self):
+        assert bs._tokenize("GPT-3 has 175B params.") == [
+            "gpt-3",
+            "has",
+            "175b",
+            "params",
+        ]
+
+
+class TestNgrams:
+    def test_5gram_set(self):
+        tokens = ["a", "b", "c", "d", "e", "f"]
+        # Two contiguous 5-grams: (a,b,c,d,e) and (b,c,d,e,f)
+        result = bs._ngram_set(tokens, n=5)
+        assert result == {("a", "b", "c", "d", "e"), ("b", "c", "d", "e", "f")}
+
+    def test_dedup_repeats(self):
+        tokens = ["x"] * 7
+        # All 5-grams identical → set of size 1
+        assert bs._ngram_set(tokens, n=5) == {("x", "x", "x", "x", "x")}
+
+    def test_too_short_returns_empty(self):
+        assert bs._ngram_set(["a", "b", "c"], n=5) == set()
+
+
+class TestCoverageMetrics:
+    def test_perfect_overlap(self):
+        text = "the quick brown fox jumps over the lazy dog and runs away"
+        m = bs._coverage_metrics(returned=text, gold=text)
+        assert m["recall"] == 1.0
+        assert m["precision"] == 1.0
+
+    def test_returned_subset_of_gold(self):
+        gold = "alpha beta gamma delta epsilon zeta eta theta iota kappa"
+        # First 6 words → 2 unique 5-grams; gold has 6 unique 5-grams
+        returned = "alpha beta gamma delta epsilon zeta"
+        m = bs._coverage_metrics(returned=returned, gold=gold)
+        # recall = |intersection| / |gold ngrams| = 2/6
+        assert abs(m["recall"] - 2 / 6) < 1e-9
+        # precision = |intersection| / |returned ngrams| = 2/2
+        assert m["precision"] == 1.0
+
+    def test_disjoint_strings(self):
+        m = bs._coverage_metrics(
+            returned="aa bb cc dd ee ff",
+            gold="zz yy xx ww vv uu",
+        )
+        assert m["recall"] == 0.0
+        assert m["precision"] == 0.0
+
+    def test_empty_returned_yields_zero(self):
+        m = bs._coverage_metrics(returned="", gold="alpha beta gamma delta epsilon")
+        assert m["recall"] == 0.0
+        assert m["precision"] == 0.0
+
+    def test_empty_gold_yields_zero(self):
+        m = bs._coverage_metrics(returned="alpha beta gamma delta epsilon", gold="")
+        assert m["recall"] == 0.0
+        assert m["precision"] == 0.0
+
+
+class TestSimulateAgentReads:
+    """Tests _simulate_agent_reads with injectable page text — no PDF I/O."""
+
+    def _page_provider(self, pages: dict[int, str]):
+        """Return a callable(page_num)->str that errors on out-of-range."""
+
+        def get_page(p: int) -> str:
+            if p not in pages:
+                raise IndexError(f"page {p} out of range")
+            return pages[p]
+
+        return get_page
+
+    def test_zero_extra_reads_when_initial_page_covers(self):
+        gold = "alpha beta gamma delta epsilon zeta eta theta iota kappa"
+        pages = {3: gold}  # initial hit covers everything
+        get_page = self._page_provider(pages)
+        gold_section = bs.Section("X", 1, 5, gold)
+        reads = bs._simulate_agent_reads(
+            initial_page=3,
+            gold_section=gold_section,
+            get_page=get_page,
+            doc_total_pages=5,
+        )
+        assert reads == 0
+
+    def test_walks_outward_alternating_forward_first(self):
+        # Verifies the walk visits N+1 before N-1 (forward-first) and stops
+        # as soon as token coverage clears the 95% target.
+        # Gold has 3 unique tokens placed on consecutive pages 3, 4, 5 — so
+        # the agent reads page 4 (forward) → 67% then page 2 (backward, no
+        # new tokens) → 67% then page 5 (forward) → 100%. Stops at 3 reads.
+        gold = "w1 w2 w3"
+        pages = {
+            1: "filler-a",
+            2: "filler-b",
+            3: "w1",  # initial hit
+            4: "w2",  # forward neighbour, contributes w2
+            5: "w3",  # second-forward, contributes w3 → 100%
+        }
+        get_page = self._page_provider(pages)
+        gold_section = bs.Section("X", 1, 5, gold)
+        reads = bs._simulate_agent_reads(
+            initial_page=3,
+            gold_section=gold_section,
+            get_page=get_page,
+            doc_total_pages=5,
+        )
+        # Walk order [4, 2, 5, 1]:
+        #   start: {w1} → 33%
+        #   +4: {w1,w2} → 67%
+        #   +2: {w1,w2} → 67% (filler-b adds nothing relevant)
+        #   +5: {w1,w2,w3} → 100% ≥ 95% → stop
+        assert reads == 3
+
+    def test_walk_order_traversal_when_coverage_never_reaches_target(self):
+        # Pages contain only filler; coverage never reaches the target and the
+        # agent walks the entire bounded order before the for-loop exhausts.
+        # Walk from page 3 with doc_total=5 is [4, 2, 5, 1] → reads = 4.
+        gold = "alpha beta gamma delta epsilon zeta eta theta iota kappa"
+        pages = {p: "filler " * 50 for p in range(1, 6)}
+        pages[3] = "alpha beta"  # initial hit, 2 of 10 tokens = 20%
+        get_page = self._page_provider(pages)
+        gold_section = bs.Section("X", 1, 5, gold)
+        reads = bs._simulate_agent_reads(
+            initial_page=3,
+            gold_section=gold_section,
+            get_page=get_page,
+            doc_total_pages=5,
+        )
+        assert reads == 4
+
+    def test_caps_at_max_extra_reads(self):
+        # Gold needs many pages but get_page never gets coverage to 95%
+        gold = " ".join(f"w{i}" for i in range(200))
+        # All pages return one irrelevant word
+        pages = {i: "noise" for i in range(1, 30)}
+        pages[5] = gold[:50]  # initial page has tiny fragment
+        get_page = self._page_provider(pages)
+        gold_section = bs.Section("X", 1, 30, gold)
+        reads = bs._simulate_agent_reads(
+            initial_page=5,
+            gold_section=gold_section,
+            get_page=get_page,
+            doc_total_pages=30,
+        )
+        assert reads == bs.MAX_EXTRA_READS  # capped at 10
+
+    def test_skips_out_of_bounds_pages_without_counting(self):
+        # initial_page=1 means N-1=0 (out of bounds) — must be skipped silently
+        gold_words = " ".join(f"w{i}" for i in range(1, 21))  # 20 unique tokens
+        pages = {
+            1: " ".join(f"w{i}" for i in range(1, 11)),  # w1..w10
+            2: " ".join(f"w{i}" for i in range(11, 21)),  # w11..w20
+        }
+        get_page = self._page_provider(pages)
+        gold_section = bs.Section("X", 1, 2, gold_words)
+        reads = bs._simulate_agent_reads(
+            initial_page=1,
+            gold_section=gold_section,
+            get_page=get_page,
+            doc_total_pages=2,
+        )
+        # Page 1: 10/20 = 50%. Walks to N+1=2 → 20/20 = 100%. N-1=0 skipped.
+        assert reads == 1
+
+
+class TestSectionSearch:
+    """Tests _section_search — BM25-over-sections ranker."""
+
+    def test_returns_highest_scoring_section(self):
+        sections = [
+            bs.Section("Intro", 1, 5, "introduction text introducing things"),
+            bs.Section("Methods", 6, 10, "method method method experimental approach"),
+            bs.Section("Results", 11, 15, "results we found we observed"),
+        ]
+        result = bs._section_search("p.pdf", "method", sections=sections, top_k=1)
+        assert len(result["sections"]) == 1
+        assert result["sections"][0]["title"] == "Methods"
+
+    def test_returns_empty_when_query_terms_missing(self):
+        sections = [bs.Section("Intro", 1, 5, "alpha beta gamma")]
+        result = bs._section_search("p.pdf", "zeta", sections=sections, top_k=1)
+        assert result["sections"] == []
+
+    def test_returns_empty_when_sections_list_empty(self):
+        result = bs._section_search("p.pdf", "anything", sections=[], top_k=1)
+        assert result["sections"] == []
+
+    def test_returns_empty_for_empty_query(self):
+        sections = [bs.Section("X", 1, 5, "alpha beta gamma")]
+        result = bs._section_search("p.pdf", "", sections=sections, top_k=1)
+        assert result["sections"] == []
+
+    def test_top_k_returns_ranked_distinct_sections(self):
+        # Same shared term "alpha" in both sections; Methods has higher TF
+        sections = [
+            bs.Section("Intro", 1, 5, "alpha beta gamma delta epsilon"),
+            bs.Section("Methods", 6, 10, "alpha alpha alpha beta gamma"),
+        ]
+        result = bs._section_search("p.pdf", "alpha", sections=sections, top_k=2)
+        titles = [s["title"] for s in result["sections"]]
+        # BM25 ranks shorter-doc-with-more-hits higher (TF * length norm)
+        assert "Methods" in titles
+        assert "Intro" in titles
+        assert titles[0] == "Methods"  # higher TF wins
+
+    def test_skips_sections_with_empty_text(self):
+        # Sections without text shouldn't crash the ranker
+        sections = [
+            bs.Section("Empty", 1, 1, ""),
+            bs.Section("Real", 2, 5, "alpha beta gamma"),
+        ]
+        result = bs._section_search("p.pdf", "alpha", sections=sections, top_k=1)
+        assert len(result["sections"]) == 1
+        assert result["sections"][0]["title"] == "Real"
+
+
+class TestRunBoundaryGroup:
+    def test_returns_per_pdf_metrics(self, monkeypatch):
+        # Mock _extract_toc_boundaries and _detect_boundaries to return controlled
+        # sections
+        gold_pdf_a = [bs.Section("A", 1, 5, ""), bs.Section("B", 6, 10, "")]
+        gold_pdf_b = [bs.Section("X", 1, 3, ""), bs.Section("Y", 4, 8, "")]
+
+        def fake_extract(p):
+            return gold_pdf_a if "a.pdf" in p else gold_pdf_b
+
+        # Detector returns same as gold for PDF A, off-by-1 for PDF B (still passes ±1)
+        def fake_detect(p):
+            return (
+                gold_pdf_a
+                if "a.pdf" in p
+                else [
+                    bs.Section("X", 2, 0, ""),
+                    bs.Section("Y", 5, 0, ""),
+                ]
+            )
+
+        monkeypatch.setattr(bs, "_extract_toc_boundaries", fake_extract)
+        monkeypatch.setattr(bs, "_detect_boundaries", fake_detect)
+
+        pdfs = [
+            {"key": "a", "title": "PDF A", "url": "a.pdf", "_local_path": "a.pdf"},
+            {"key": "b", "title": "PDF B", "url": "b.pdf", "_local_path": "b.pdf"},
+        ]
+        result = bs.run_boundary_group(pdfs)
+        assert result["per_pdf"]["a"]["f1"] == 1.0
+        assert result["per_pdf"]["b"]["f1"] == 1.0  # within ±1 tolerance
+        assert "min_f1" in result
+        assert result["min_f1"] == 1.0
+
+    def test_detects_off_by_two_failure(self, monkeypatch):
+        gold = [bs.Section("A", 5, 0, "")]
+        monkeypatch.setattr(bs, "_extract_toc_boundaries", lambda p: gold)
+        monkeypatch.setattr(
+            bs,
+            "_detect_boundaries",
+            lambda p: [bs.Section("A", 7, 0, "")],  # off by 2
+        )
+        pdfs = [{"key": "x", "title": "X", "url": "x.pdf", "_local_path": "x.pdf"}]
+        result = bs.run_boundary_group(pdfs)
+        assert result["per_pdf"]["x"]["f1"] == 0.0
+        assert result["min_f1"] == 0.0
+
+
+class TestRunCompletenessGroup:
+    def test_excludes_sub_threshold_sections(self, monkeypatch):
+        # Tiny section (text < 1000 chars) must be skipped
+        small = bs.Section("Small", 1, 1, "tiny text")
+        big = bs.Section("Big", 2, 5, "word " * 500)  # 2500 chars
+        gold = [small, big]
+
+        monkeypatch.setattr(bs, "_extract_toc_boundaries", lambda p: gold)
+        # The detector is exercised by Task 7's tests; here we stub it to return
+        # the same shape as gold so Group 2 can run in isolation.
+        monkeypatch.setattr(bs, "_detect_boundaries", lambda p: gold)
+
+        # Page text covers exactly the matched page (1 of 4 → ~25% recall expected)
+        # Set up mocks that always return the matched page text
+        def fake_get_page_text(pdf_path: str, page: int) -> str:
+            return big.text  # whole section content on the matched page (artificial)
+
+        # page-mode pdf_search: hit page = big.start_page
+        def fake_keyword_search(pdf_path, query, top_k):
+            return {"matches": [{"page": big.start_page, "excerpt": ""}]}
+
+        # section-mode: returns the gold section text. Note the new `sections=` kwarg.
+        def fake_section_search(pdf_path, query, sections, top_k=1):
+            return {
+                "sections": [
+                    {
+                        "title": big.title,
+                        "start_page": big.start_page,
+                        "end_page": big.end_page,
+                        "text": big.text,
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(bs, "_get_page_text", fake_get_page_text)
+        monkeypatch.setattr(bs, "_keyword_page_search", fake_keyword_search)
+        monkeypatch.setattr(bs, "_section_search", fake_section_search)
+        monkeypatch.setattr(bs, "_doc_total_pages", lambda p: 5)
+
+        pdfs = [{"key": "x", "title": "X", "url": "x.pdf", "_local_path": "x.pdf"}]
+        result = bs.run_completeness_group(pdfs)
+
+        # Only the "Big" section should appear in the per-section results
+        sections_evaluated = result["per_pdf"]["x"]["sections"]
+        assert len(sections_evaluated) == 1
+        assert sections_evaluated[0]["title"] == "Big"
+
+    def test_section_mode_recall_higher_than_page_mode(self, monkeypatch):
+        # Construct a 2-page section where page mode gets only half
+        page_a = "alpha beta gamma delta epsilon zeta eta theta iota kappa " * 30
+        page_b = "lambda mu nu xi omicron pi rho sigma tau upsilon " * 30
+        section_text = page_a + page_b
+        gold = [bs.Section("S", 1, 2, section_text)]
+
+        monkeypatch.setattr(bs, "_extract_toc_boundaries", lambda p: gold)
+        monkeypatch.setattr(bs, "_detect_boundaries", lambda p: gold)
+        monkeypatch.setattr(
+            bs,
+            "_get_page_text",
+            lambda path, page: page_a if page == 1 else page_b,
+        )
+        monkeypatch.setattr(
+            bs,
+            "_keyword_page_search",
+            lambda path, q, top_k: {"matches": [{"page": 1, "excerpt": ""}]},
+        )
+        monkeypatch.setattr(
+            bs,
+            "_section_search",
+            lambda path, q, sections, top_k=1: {
+                "sections": [
+                    {"title": "S", "start_page": 1, "end_page": 2, "text": section_text}
+                ]
+            },
+        )
+        monkeypatch.setattr(bs, "_doc_total_pages", lambda p: 2)
+
+        pdfs = [{"key": "x", "title": "X", "url": "x.pdf", "_local_path": "x.pdf"}]
+        result = bs.run_completeness_group(pdfs)
+        sec = result["per_pdf"]["x"]["sections"][0]
+        assert sec["section_mode"]["recall"] > sec["page_mode"]["recall"]
+        assert sec["section_mode"]["recall"] >= 0.95  # near-full coverage
+
+
+class TestRunToolcallGroup:
+    def test_section_mode_always_zero_extra_reads(self, monkeypatch):
+        gold = [bs.Section("S", 1, 3, "x " * 600)]
+        monkeypatch.setattr(bs, "_extract_toc_boundaries", lambda p: gold)
+        monkeypatch.setattr(
+            bs,
+            "_keyword_page_search",
+            lambda path, q, top_k=1: {"matches": [{"page": 1, "excerpt": ""}]},
+        )
+        monkeypatch.setattr(bs, "_get_page_text", lambda path, page: "x " * 200)
+        monkeypatch.setattr(bs, "_doc_total_pages", lambda p: 3)
+
+        pdfs = [{"key": "x", "title": "X", "url": "x.pdf", "_local_path": "x.pdf"}]
+        result = bs.run_toolcall_group(pdfs)
+        sec_results = result["per_pdf"]["x"]["sections"]
+        # Section mode is always 0
+        assert all(r["section_mode_extra_reads"] == 0 for r in sec_results)
+
+    def test_fraction_zero_extra_reads_reported(self, monkeypatch):
+        # Two sections; one needs 1 extra read in page mode, one needs 0.
+        # Use distinct tokens so token-coverage is meaningful (the original
+        # "x " * 600 had only one unique token, defeating coverage growth).
+        s1 = bs.Section("Done in one", 1, 1, "alpha beta " * 500)
+        # s2 spans pages 2-3 with 5 distinct gold tokens. Page 2 has only 2;
+        # the agent must walk to page 3 to get the rest.
+        s2 = bs.Section(
+            "Needs walk",
+            2,
+            3,
+            " ".join(["alpha beta gamma delta epsilon"] * 50),  # 5 unique tokens
+        )
+        monkeypatch.setattr(bs, "_extract_toc_boundaries", lambda p: [s1, s2])
+        monkeypatch.setattr(bs, "_doc_total_pages", lambda p: 3)
+
+        def fake_keyword_search(path, q, top_k=1):
+            page = 1 if q == s1.title else 2
+            return {"matches": [{"page": page, "excerpt": ""}]}
+
+        monkeypatch.setattr(bs, "_keyword_page_search", fake_keyword_search)
+
+        def fake_page_text(path, page):
+            if page == 1:
+                return s1.text  # page 1 covers s1 fully
+            if page == 2:
+                return "alpha beta"  # only 2 of s2's 5 tokens — needs walk
+            if page == 3:
+                return "gamma delta epsilon"  # remaining 3 tokens
+            return ""
+
+        monkeypatch.setattr(bs, "_get_page_text", fake_page_text)
+        pdfs = [{"key": "x", "title": "X", "url": "x.pdf", "_local_path": "x.pdf"}]
+        result = bs.run_toolcall_group(pdfs)
+        per_pdf = result["per_pdf"]["x"]
+        # Section mode is always 0 reads
+        assert per_pdf["section_mode_zero_read_fraction"] == 1.0
+        # Page mode: s1 = 0 reads (full coverage on hit page),
+        # s2 = 1 extra read (page 2 → 40% → walk to page 3 → 100%) → 50% zero-read
+        assert per_pdf["page_mode_zero_read_fraction"] == 0.5
+
+
+class TestSaveResults:
+    def test_writes_txt_and_json(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        bs._OUTPUT.clear()
+        bs._OUTPUT.append("\x1b[32mline 1\x1b[0m")
+        bs._OUTPUT.append("line 2")
+        results = {"group_1": {"min_f1": 0.9}}
+        bs._save_results(
+            results,
+            file_timestamp="20260503_120000",
+            iso_timestamp="2026-05-03T12:00:00",
+        )
+        txt = (
+            tmp_path / "benchmark_results" / "sections_20260503_120000.txt"
+        ).read_text()
+        assert "line 1" in txt
+        assert "\x1b[" not in txt  # ANSI stripped
+        data = json.loads(
+            (
+                tmp_path / "benchmark_results" / "sections_20260503_120000.json"
+            ).read_text()
+        )
+        assert data["timestamp"] == "2026-05-03T12:00:00"
+        assert data["results"] == results
+
+
+class TestMainExitCodes:
+    def _common_mocks(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        # Stub _resolve_path to avoid network/cache I/O
+        monkeypatch.setattr(
+            bs, "_resolve_pdf_local_path", lambda url: f"/fake/{url.split('/')[-1]}.pdf"
+        )
+        # Stub group runners
+        monkeypatch.setattr(
+            bs,
+            "run_boundary_group",
+            lambda pdfs, **kwargs: {
+                "per_pdf": {
+                    p["key"]: {
+                        "f1": 1.0,
+                        "precision": 1.0,
+                        "recall": 1.0,
+                        "tp": 1,
+                        "fp": 0,
+                        "fn": 0,
+                        "n_gold": 1,
+                        "n_detected": 1,
+                    }
+                    for p in pdfs
+                },
+                "min_f1": 1.0,
+            },
+        )
+        monkeypatch.setattr(
+            bs,
+            "run_completeness_group",
+            lambda pdfs, **kwargs: {
+                "per_pdf": {},
+                "min_section_recall": 1.0,
+                "min_section_precision": 1.0,
+                "min_recall_delta": 0.6,
+            },
+        )
+        monkeypatch.setattr(
+            bs,
+            "run_toolcall_group",
+            lambda pdfs, **kwargs: {
+                "per_pdf": {},
+                "min_section_zero_fraction": 1.0,
+            },
+        )
+
+    def test_pass_returns_zero(self, monkeypatch, tmp_path):
+        self._common_mocks(monkeypatch, tmp_path)
+        import pytest
+
+        with pytest.raises(SystemExit) as exc:
+            bs.main(argv=[])
+        assert exc.value.code == 0
+
+    def test_fail_returns_one(self, monkeypatch, tmp_path):
+        self._common_mocks(monkeypatch, tmp_path)
+        # Force a Group 1 failure
+        monkeypatch.setattr(
+            bs,
+            "run_boundary_group",
+            lambda pdfs, **kwargs: {
+                "per_pdf": {
+                    p["key"]: {
+                        "f1": 0.5,
+                        "precision": 0.5,
+                        "recall": 0.5,
+                        "tp": 1,
+                        "fp": 1,
+                        "fn": 1,
+                        "n_gold": 2,
+                        "n_detected": 2,
+                    }
+                    for p in pdfs
+                },
+                "min_f1": 0.5,
+            },
+        )
+        import pytest
+
+        with pytest.raises(SystemExit) as exc:
+            bs.main(argv=[])
+        assert exc.value.code == 1
+
+    def test_calibrate_returns_zero_even_when_below_threshold(
+        self, monkeypatch, tmp_path
+    ):
+        self._common_mocks(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            bs,
+            "run_boundary_group",
+            lambda pdfs, **kwargs: {
+                "per_pdf": {
+                    p["key"]: {
+                        "f1": 0.0,
+                        "precision": 0.0,
+                        "recall": 0.0,
+                        "tp": 0,
+                        "fp": 0,
+                        "fn": 1,
+                        "n_gold": 1,
+                        "n_detected": 0,
+                    }
+                    for p in pdfs
+                },
+                "min_f1": 0.0,
+            },
+        )
+        import pytest
+
+        with pytest.raises(SystemExit) as exc:
+            bs.main(argv=["--calibrate"])
+        assert exc.value.code == 0
+
+    def test_setup_error_returns_two(self, monkeypatch, tmp_path):
+        self._common_mocks(monkeypatch, tmp_path)
+
+        def boom(pdfs, **kwargs):
+            raise ValueError("PDF has no TOC — cannot derive ground truth")
+
+        monkeypatch.setattr(bs, "run_boundary_group", boom)
+        import pytest
+
+        with pytest.raises(SystemExit) as exc:
+            bs.main(argv=[])
+        assert exc.value.code == 2
+
+    def test_groups_flag_restricts_runs(self, monkeypatch, tmp_path):
+        self._common_mocks(monkeypatch, tmp_path)
+        called = []
+        monkeypatch.setattr(
+            bs,
+            "run_boundary_group",
+            lambda pdfs, **kwargs: called.append(1) or {"per_pdf": {}, "min_f1": 1.0},
+        )
+        monkeypatch.setattr(
+            bs,
+            "run_completeness_group",
+            lambda pdfs, **kwargs: called.append(2)
+            or {
+                "per_pdf": {},
+                "min_section_recall": 1.0,
+                "min_section_precision": 1.0,
+                "min_recall_delta": 1.0,
+            },
+        )
+        monkeypatch.setattr(
+            bs,
+            "run_toolcall_group",
+            lambda pdfs, **kwargs: called.append(3)
+            or {"per_pdf": {}, "min_section_zero_fraction": 1.0},
+        )
+        import pytest
+
+        with pytest.raises(SystemExit):
+            bs.main(argv=["--groups", "1"])
+        assert called == [1]

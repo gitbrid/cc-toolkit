@@ -1,0 +1,390 @@
+# tests/conftest.py
+"""Shared test fixtures for pdf-mcp tests."""
+
+import base64
+import os
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+import pymupdf
+import pytest
+
+from pdf_mcp.cache import PDFCache
+from pdf_mcp.url_fetcher import URLFetcher
+import pdf_mcp.server as server_module
+
+
+@pytest.fixture
+def temp_cache_dir():
+    """Create a temporary cache directory."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir)
+
+
+@pytest.fixture
+def cache(temp_cache_dir):
+    """Create a cache instance with temporary directory."""
+    return PDFCache(cache_dir=temp_cache_dir, ttl_hours=1)
+
+
+@pytest.fixture
+def sample_pdf():
+    """Create a sample 5-page PDF for testing."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+
+        for i in range(5):
+            page = doc.new_page()
+            text = f"This is page {i + 1} content.\n\nSome sample text for testing."
+            page.insert_text((50, 50), text)
+
+        doc.save(f.name)
+        doc.close()
+
+        # Resolve symlinks so paths match what _resolve_path() returns
+        resolved = str(Path(f.name).resolve())
+        yield resolved
+
+        os.unlink(resolved)
+
+
+@pytest.fixture
+def isolated_server(temp_cache_dir, monkeypatch):
+    """
+    Isolate server module globals for testing.
+    Returns tuple of (cache, url_fetcher) instances used.
+    """
+    test_cache = PDFCache(cache_dir=temp_cache_dir, ttl_hours=1)
+    test_url_fetcher = URLFetcher(cache_dir=temp_cache_dir / "downloads")
+
+    monkeypatch.setattr(server_module, "cache", test_cache)
+    monkeypatch.setattr(server_module, "url_fetcher", test_url_fetcher)
+
+    return test_cache, test_url_fetcher
+
+
+@pytest.fixture
+def sample_pdf_with_toc():
+    """Create a PDF with table of contents."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+
+        for i in range(3):
+            page = doc.new_page()
+            page.insert_text((50, 50), f"Chapter {i + 1} content")
+
+        # Add TOC
+        toc = [
+            [1, "Chapter 1", 1],
+            [1, "Chapter 2", 2],
+            [1, "Chapter 3", 3],
+        ]
+        doc.set_toc(toc)
+
+        doc.save(f.name)
+        doc.close()
+
+        yield f.name
+        os.unlink(f.name)
+
+
+@pytest.fixture
+def sample_pdf_with_toc_sections(tmp_path):
+    """A 5-page PDF with set_toc and distinctive body text per section."""
+    path = tmp_path / "with_toc_sections.pdf"
+    doc = pymupdf.open()
+    contents = [
+        ("Introduction", "introduction body about graph neural networks"),
+        ("Methods", "methods describing graph attention mechanism in detail"),
+        ("Results", "results we observed strong performance gains"),
+        ("Discussion", "discussion of implications and tradeoffs"),
+        ("Conclusion", "conclusion and future work directions"),
+    ]
+    for title, body in contents:
+        page = doc.new_page(width=600, height=800)
+        page.insert_text((50, 100), title, fontsize=14)
+        page.insert_text((50, 130), body, fontsize=11)
+    doc.set_toc(
+        [
+            [1, "Introduction", 1],
+            [1, "Methods", 2],
+            [1, "Results", 3],
+            [1, "Discussion", 4],
+            [1, "Conclusion", 5],
+        ]
+    )
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
+@pytest.fixture
+def sample_pdf_with_large_toc():
+    """Create a PDF with more than 50 TOC entries (triggers truncation)."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+
+        for i in range(60):
+            page = doc.new_page()
+            page.insert_text((50, 50), f"Slide {i + 1} content")
+
+        toc = [[1, f"Slide {i + 1}: Topic", i + 1] for i in range(60)]
+        doc.set_toc(toc)
+
+        doc.save(f.name)
+        doc.close()
+
+        yield f.name
+        os.unlink(f.name)
+
+
+@pytest.fixture
+def sample_pdf_with_images():
+    """Create a PDF with embedded images."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+        page = doc.new_page()
+
+        # Create a simple colored rectangle as an "image"
+        rect = pymupdf.Rect(100, 100, 200, 200)
+        page.draw_rect(rect, color=(1, 0, 0), fill=(0, 0, 1))
+
+        # Insert actual image (create minimal PNG)
+        # 1x1 red PNG
+        png_data = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+        )
+        page.insert_image(pymupdf.Rect(50, 50, 80, 80), stream=png_data)
+
+        doc.save(f.name)
+        doc.close()
+
+        yield f.name
+        os.unlink(f.name)
+
+
+@pytest.fixture
+def sample_pdf_dup_image():
+    """PDF placing the SAME embedded image twice on one page.
+
+    One xref, two placements.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+        page = doc.new_page()
+        png_data = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+        )
+        page.insert_image(pymupdf.Rect(50, 50, 80, 80), stream=png_data)
+        page.insert_image(pymupdf.Rect(120, 120, 150, 150), stream=png_data)
+        doc.save(f.name)
+        doc.close()
+        yield f.name
+        os.unlink(f.name)
+
+
+@pytest.fixture
+def sample_pdf_two_distinct_images():
+    """PDF with two DIFFERENT embedded images on one page (two distinct xrefs)."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+        page = doc.new_page()
+        red = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+        )
+        blue = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAACXBIWXMAAA7E"
+            "AAAOxAGVKw4bAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC"
+        )
+        page.insert_image(pymupdf.Rect(50, 50, 80, 80), stream=red)
+        page.insert_image(pymupdf.Rect(120, 120, 150, 150), stream=blue)
+        doc.save(f.name)
+        doc.close()
+        yield f.name
+        os.unlink(f.name)
+
+
+@pytest.fixture
+def sample_pdf_scanned():
+    """PDF with zero extractable text but raster images (scan simulation)."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+        page = doc.new_page()
+        png_data = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+        )
+        page.insert_image(pymupdf.Rect(50, 50, 400, 600), stream=png_data)
+        doc.save(f.name)
+        doc.close()
+        yield str(Path(f.name).resolve())
+        os.unlink(f.name)
+
+
+@pytest.fixture
+def sample_pdf_mixed():
+    """PDF with pages 1-2 having text and pages 3-4 being image-only."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+        png_data = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+        )
+        for i in range(2):
+            page = doc.new_page()
+            page.insert_text((50, 50), f"Page {i + 1} has text content here.")
+        for _ in range(2):
+            page = doc.new_page()
+            page.insert_image(pymupdf.Rect(50, 50, 400, 600), stream=png_data)
+        doc.save(f.name)
+        doc.close()
+        yield str(Path(f.name).resolve())
+        os.unlink(f.name)
+
+
+@pytest.fixture
+def mock_url_to_pdf(sample_pdf):
+    """Mock URL fetcher to return sample_pdf for any URL."""
+    with patch.object(URLFetcher, "is_url", return_value=True):
+        with patch.object(URLFetcher, "fetch", return_value=sample_pdf):
+            yield sample_pdf
+
+
+@pytest.fixture
+def sample_pdf_grayscale():
+    """Create a PDF with a grayscale image."""
+    from PIL import Image
+    import io
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+        page = doc.new_page()
+
+        # Create grayscale image with PIL
+        img = Image.new("L", (50, 50), color=128)  # "L" = grayscale
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format="PNG")
+        img_bytes.seek(0)
+
+        page.insert_image(pymupdf.Rect(50, 50, 100, 100), stream=img_bytes.read())
+
+        doc.save(f.name)
+        doc.close()
+
+        yield f.name
+        os.unlink(f.name)
+
+
+@pytest.fixture
+def sample_pdf_rgba():
+    """Create a PDF with an RGBA image (transparency)."""
+    from PIL import Image
+    import io
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+        page = doc.new_page()
+
+        # Create RGBA image with PIL
+        img = Image.new(
+            "RGBA", (50, 50), color=(255, 0, 0, 128)
+        )  # Semi-transparent red
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format="PNG")
+        img_bytes.seek(0)
+
+        page.insert_image(pymupdf.Rect(50, 50, 100, 100), stream=img_bytes.read())
+
+        doc.save(f.name)
+        doc.close()
+
+        yield f.name
+        os.unlink(f.name)
+
+
+@pytest.fixture
+def pdf_with_hidden_text():
+    """Two-page PDF. Page 1: visible body PLUS a white-on-white hidden span
+    carrying a unique token ('zebra'). Page 2: clean body with its own token
+    ('omega'). Unique per-page tokens make keyword targeting deterministic."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+        p1 = doc.new_page()
+        p1.insert_text((50, 50), "alpha visible body text on page one", fontsize=12)
+        p1.insert_text(
+            (50, 90),
+            "zebra hidden injected secret instructions text here",
+            fontsize=12,
+            color=(1, 1, 1),
+        )
+        p2 = doc.new_page()
+        p2.insert_text(
+            (50, 50), "omega clean visible body text on page two", fontsize=12
+        )
+        doc.save(f.name)
+        doc.close()
+        yield f.name
+    os.unlink(f.name)
+
+
+@pytest.fixture
+def sample_pdf_with_table():
+    """Create a PDF with a detectable table.
+
+    Explicit borders are required for find_tables() to detect it.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        doc = pymupdf.open()
+        page = doc.new_page()
+
+        # Outer border (2 cols × 3 rows)
+        page.draw_rect(pymupdf.Rect(50, 50, 250, 150), color=(0, 0, 0))
+        # Column divider
+        page.draw_line(pymupdf.Point(150, 50), pymupdf.Point(150, 150), color=(0, 0, 0))
+        # Row dividers
+        page.draw_line(pymupdf.Point(50, 83), pymupdf.Point(250, 83), color=(0, 0, 0))
+        page.draw_line(pymupdf.Point(50, 116), pymupdf.Point(250, 116), color=(0, 0, 0))
+
+        # Cell text
+        page.insert_text((55, 75), "Name")
+        page.insert_text((155, 75), "Value")
+        page.insert_text((55, 108), "Alpha")
+        page.insert_text((155, 108), "1")
+        page.insert_text((55, 141), "Beta")
+        page.insert_text((155, 141), "2")
+
+        doc.save(f.name)
+        doc.close()
+        yield f.name
+        os.unlink(f.name)
+
+
+@pytest.fixture
+def corpus_dir(tmp_path):
+    """Directory of 3 small PDFs with differing page counts.
+
+    Pages carry two text blocks with repeated terms ("budget") so
+    corpus fixtures follow the realistic multi-block pattern rather
+    than unique-phrase-per-page.
+    """
+    d = tmp_path / "corpus"
+    d.mkdir()
+    for name, pages in [("alpha.pdf", 2), ("bravo.pdf", 4), ("charlie.pdf", 1)]:
+        doc = pymupdf.open()
+        for i in range(pages):
+            page = doc.new_page()
+            page.insert_text(
+                (50, 50),
+                f"Report section {i + 1}. The quarterly budget increased.",
+            )
+            page.insert_text(
+                (50, 300),
+                f"Second block on page {i + 1}. Budget details and notes.",
+            )
+        doc.save(str(d / name))
+        doc.close()
+    return d

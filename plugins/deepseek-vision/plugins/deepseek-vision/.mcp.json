@@ -1,0 +1,53 @@
+{
+  "mcpServers": {
+    "deepseek-vision": {
+      "command": "C:\\Users\\subrid\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\Scripts\\uv.exe",
+      "args": [
+        "tool",
+        "run",
+        "--env-file",
+        ".env",
+        "--with",
+        "mcp[cli]<2",
+        "mcp-vision"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "MCP_OCR_PROVIDER",
+        "DASHSCOPE_API_KEY",
+        "DASHSCOPE_MODEL",
+        "VOLCENGINE_API_KEY",
+        "VOLCENGINE_MODEL",
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_MODEL",
+        "BAIDU_OCR_API_KEY",
+        "BAIDU_OCR_SECRET_KEY",
+        "TENCENT_SECRET_ID",
+        "TENCENT_SECRET_KEY",
+        "MCP_OCR_API_KEY",
+        "MCP_OCR_BASE_URL",
+        "MCP_OCR_MODEL"
+      ],
+      "tool_timeout_sec": 300
+    },
+    "deepseek-clipboard": {
+      "command": "C:\\Users\\subrid\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\Scripts\\uv.exe",
+      "args": [
+        "tool",
+        "run",
+        "--with",
+        "mcp[cli]<2",
+        "--with",
+        "pillow",
+        "--python",
+        "3.12",
+        "python",
+        "./scripts/clipboard_mcp.py"
+      ],
+      "cwd": ".",
+      "tool_timeout_sec": 60
+    }
+  }
+}

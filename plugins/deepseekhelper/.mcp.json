@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "deepseekhelper": {
+      "command": "node",
+      "args": [
+        "--env-file=.env",
+        "scripts/server.mjs"
+      ]
+    }
+  }
+}

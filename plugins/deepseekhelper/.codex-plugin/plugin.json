@@ -1,0 +1,19 @@
+{
+  "name": "deepseekhelper",
+  "version": "0.3.4",
+  "description": "Adds DeepSeek-powered supervised task, review, discussion, verification, model selection, usage tracking, and explicit update tools for Codex.",
+  "author": {
+    "name": "DeepSeekHelper contributors"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "DeepSeekHelper",
+    "shortDescription": "Collaborate with DeepSeek under Codex supervision.",
+    "longDescription": "DeepSeekHelper exposes local MCP tools that let Codex delegate low and medium difficulty coding, documentation, and design work to DeepSeek, use DeepSeek for review, discussion, and verification on higher difficulty work, select models by Flash/Pro profile, track token usage plus cache hits, and explicitly check or apply git upstream updates.",
+    "developerName": "DeepSeekHelper contributors",
+    "category": "Productivity",
+    "capabilities": ["mcp"],
+    "defaultPrompt": "Use DeepSeekHelper with its default collaboration strategy for supervised tasks, reviews, verification, usage, or updates."
+  },
+  "mcpServers": "./.mcp.json"
+}

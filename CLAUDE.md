@@ -11,6 +11,7 @@ CC 工具库/
 ├── CLAUDE.md                    ← 你在这里
 ├── docs/                        ← 所有技能的详细介绍文档
 │   ├── README.md                ← 总索引（先看这个）
+│   ├── deepseek-tools-介绍.md   ← DeepSeek 工具集（2026-08-09 收录）
 │   ├── mattpocock-skills-介绍.md
 │   ├── nuwa-skill-介绍.md
 │   ├── wshobson-skills-介绍.md
@@ -27,7 +28,9 @@ CC 工具库/
 │   ├── superpowers-skills/      ← obra/superpowers (14个工程工作流技能)
 │   ├── cexll-skills/            ← cexll/myclaude (11个自动化技能)
 │   ├── misc-skills/             ← 杂项技能 (1个)
-│   └── custom-agents/           ← 自定义Agent (4个中文Agent)
+│   ├── custom-agents/           ← 自定义Agent (4个中文Agent)
+│   └── the-learning-skill/      ← 学习教练技能（toddward，2026-08-09收录）
+├── plugins/                     ← Codex / Obsidian 插件源码（deepseekhelper / deepseek-vision / obsidian-deepseek-note-helper）
 └── mcp/                         ← MCP 收藏子库
     └── README.md                ← MCP 推荐清单与收藏索引
 ```

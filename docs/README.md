@@ -122,12 +122,27 @@
 
 好用的 MCP 服务器推荐与收藏见 [mcp/README.md](../mcp/README.md)，涵盖官方全家桶、社区高频、按场景速查。
 
+### DeepSeek 工具集（2026-08-09 收录）✅
+
+**[DeepSeek 工具](./deepseek-tools-介绍.md)** — DeepSeekHelper（Codex 插件）、DeepSeek MCP Server、DeepSeek Vision（Codex 插件）已收录并部署：
+- DeepSeekHelper：Codex 与 DeepSeek 监督协作，委托/审查/讨论/验证/用量统计
+- DeepSeek MCP Server：`deepseek_chat` / `deepseek_fim` / `deepseek_sessions`
+- DeepSeek Vision：给纯文本 DeepSeek 补图片分析、OCR、扫描 PDF 转 DOCX
+- B站视频阅读器已切到 `deepseek-v4-flash`
+
 ### 本地 RAG（知识库检索，实战验证）✅
 
 **[rag-mcp + llama.cpp](./rag-mcp-介绍.md)** — 对本地 PDF/文档库做向量检索，数据不出本机。伴学项目（60+ 本教材书库）实战收录：
 - 工具：`index_document` / `search_docs` / `list_indexed_docs` / `delete_document`
 - embedding 后端：llama.cpp `llama-server` + bge-m3（1024 维多语言，中文好），端口 8080，OpenAI 兼容 `/v1/embeddings`
 - 存储：ChromaDB 持久化；中文教材扫描版需先 OCR；数学公式页读图而非 OCR
+
+### 2026-08-09 第二批工具 ✅
+
+- [rag-mcp-server](./rag-mcp-server-介绍.md)：Rubrum95 RAG MCP 备选，OCR + 页码引用
+- [pdf-mcp](./pdf-mcp-介绍.md)：大 PDF 精准读取 MCP，混合检索 + OCR + 表格提取，已挂到 Codex
+- [the-learning-skill](./the-learning-skill-介绍.md)：学习教练 Agent Skill，已复制到伴学项目
+- [obsidian-deepseek-note-helper](./obsidian-deepseek-note-helper-介绍.md)：Obsidian 侧边栏 DeepSeek 助手插件
 
 ---
 
@@ -141,3 +156,5 @@
 | 2026-08-01 | 目录重组：所有技能来源收进 `skills/` 子库，新增 `mcp/` 子库 |
 | 2026-08-01 | MCP 排障：移除 time（官方包下架 404）与 fetch（npm 同名包为蜜罐），本机收敛为 4 个可用 MCP |
 | 2026-08-01 | 新增本地 RAG：rag-mcp + llama.cpp + bge-m3（伴学项目实战收录），见 [rag-mcp-介绍.md](./rag-mcp-介绍.md) |
+| 2026-08-09 | 新增 DeepSeek 工具集：DeepSeekHelper、DeepSeek MCP Server、DeepSeek Vision，见 [deepseek-tools-介绍.md](./deepseek-tools-介绍.md) |
+| 2026-08-09 | 第二批：rag-mcp-server、pdf-mcp、the-learning-skill、obsidian-deepseek-note-helper 收录 |

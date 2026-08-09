@@ -41,8 +41,55 @@
 | 精确的语义搜索 | Tavily / Exa |
 | 深度分析复杂问题 | Sequential Thinking |
 | 对本地 PDF/文档库做语义检索 | rag-mcp + llama.cpp（见下方「本地 RAG」） |
+| 在 MCP 客户端里直接调用 DeepSeek | deepseek-mcp-server（见下方「DeepSeek MCP Server」） |
+| 大 PDF 精准读取 / OCR / 表格提取 | pdf-mcp（见下方「pdf-mcp」） |
 
-## 四、如何在 Claude Code 中安装
+## 四、pdf-mcp（2026-08-09 收录）
+
+**本地路径**：`D:\program\CC 工具库\mcp\pdf-mcp`
+
+对论文、教材、财报等大 PDF 做“外科手术式”读取：混合检索、分页读取、表格/图片提取、扫描版 OCR、SQLite 缓存。
+
+Codex 全局配置已挂载：
+
+```toml
+[mcp_servers.pdf-mcp]
+type = "stdio"
+command = "C:\\Users\\subrid\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\Scripts\\uv.exe"
+args = ["tool", "run", "pdf-mcp"]
+```
+
+详细说明见 [docs/pdf-mcp-介绍.md](../docs/pdf-mcp-介绍.md)。
+
+## 五、RAG MCP 备选（2026-08-09 收录）
+
+| 方案 | 位置 | 用途 |
+|---|---|---|
+| rag-mcp（实战在用） | `mcp/rag-mcp` | llama.cpp + bge-m3 + ChromaDB，中文教材语义检索 |
+| rag-mcp-server | `mcp/rag-mcp-server` | Rubrum95 备选，OCR + 页码引用，配置见 [docs/rag-mcp-server-介绍.md](../docs/rag-mcp-server-介绍.md) |
+
+## 六、DeepSeek MCP Server（2026-08-09 收录）
+
+**本地路径**：`D:\program\CC 工具库\mcp\deepseek-mcp-server`
+
+| 工具 | 用途 |
+|---|---|
+| `deepseek_chat` | 对话、思考模式、函数调用、JSON Schema 校验 |
+| `deepseek_fim` | 代码补全（前缀/后缀填空） |
+| `deepseek_sessions` | 多轮会话管理（list / clear / delete） |
+
+Codex 全局配置（`~/.codex/config.toml`）：
+
+```toml
+[mcp_servers.deepseek]
+type = "stdio"
+command = "node"
+args = ["--env-file=D:/program/CC 工具库/mcp/deepseek-mcp-server/.env", "D:/program/CC 工具库/mcp/deepseek-mcp-server/dist/index.js"]
+```
+
+`.env` 已写入 `DEEPSEEK_API_KEY` 与 `DEEPSEEK_BASE_URL`，被 gitignore 排除。Cursor / Claude Code 接入时复制该 server 配置即可。
+
+## 七、如何在 Claude Code 中安装
 
 ### 方式一：交互式（推荐）
 
@@ -64,7 +111,7 @@
 }
 ```
 
-## 五、本机已启用的 MCP
+## 八、本机已启用的 MCP
 
 以下 MCP 已在本机 Claude Code 会话中启用，可在当前环境中直接使用：
 
@@ -85,7 +132,7 @@
 
 ---
 
-## 六、本地 RAG（知识库向量检索，数据不出本机）
+## 九、本地 RAG（知识库向量检索，数据不出本机）
 
 对本地 PDF / Markdown / 代码库做语义检索，适合**大量资料无法整本进上下文**的场景（如几十本教材的书库）。
 
@@ -124,3 +171,5 @@ llama-server.exe -m bge-m3.gguf --embedding --pooling cls --host 127.0.0.1 --por
 | 2026-08-01 | 本机配置 Playwright MCP（@playwright/mcp 0.0.78），用系统 Chrome 跳过浏览器下载 |
 | 2026-08-01 | 排障：移除 time（官方包 npm 404）与 fetch（npm 同名包为蜜罐），本机收敛为 4 个可用 MCP |
 | 2026-08-01 | 新增「本地 RAG」：rag-mcp + llama.cpp + bge-m3 + ChromaDB（伴学项目实战收录），详见 docs/rag-mcp-介绍.md |
+| 2026-08-09 | 新增「DeepSeek MCP Server」：arikusi/deepseek-mcp-server v2.2.0，已挂载到 Codex 全局 |
+| 2026-08-09 | 新增「pdf-mcp」与 RAG MCP 备选：pdf-mcp 已挂载 Codex 全局，rag-mcp/rag-mcp-server 收录源码 |

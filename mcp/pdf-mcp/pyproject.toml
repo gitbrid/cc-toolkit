@@ -1,0 +1,179 @@
+[project]
+name = "pdf-mcp"
+version = "2.1.0"
+description = "Surgical PDF access for AI agents: keyword, semantic & hybrid search; structured extraction of text, tables, images & TOC; OCR; and CJK/vertical-script support — with SQLite caching."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Kevin Tan", email = "6021013+jztan@users.noreply.github.com" }
+]
+maintainers = [
+    { name = "Kevin Tan", email = "6021013+jztan@users.noreply.github.com" }
+]
+keywords = [
+    "mcp",
+    "pdf",
+    "ai",
+    "claude",
+    "llm",
+    "document-processing",
+    "model-context-protocol",
+    "anthropic",
+    "pdf-extraction",
+    "ai-agent",
+    "pdf-reader",
+    "document-ai"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: General",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "fastmcp>=3.0.0",
+    "pymupdf>=1.24.0",
+    "pydantic>=2.0",
+    # Imported directly (mcp.types) in server.py; arrives transitively via
+    # fastmcp today, but declare it explicitly so the direct import can't break
+    # if fastmcp ever drops/renames it. Stay within fastmcp's <2.0 cap; floor at
+    # 1.28.1 to clear CVE-2026-52869/52870 (fixed 1.27.2) and CVE-2026-59950
+    # (fixed 1.28.1).
+    "mcp>=1.28.1,<2.0",
+    # Required at import time by chart_extractor (unconditional `import numpy`),
+    # which server.py imports on every startup — so it's a core runtime dep, not
+    # optional. Also used by fastembed.
+    "numpy>=1.24",
+    # Semantic/hybrid search. Core, not an extra (since the corpus-search
+    # release): hybrid RRF is the validated core of the tool and every install
+    # channel (PyPI, MCP Registry, uvx) should deliver it. Platform note: pulls onnxruntime, which
+    # has no wheels for Intel macOS on Python 3.14+ or musl/Alpine — those
+    # environments need Python <= 3.13 or a from-source onnxruntime build.
+    # Do not declare a new Python version in classifiers/CI before
+    # fastembed/onnxruntime ship wheels for it.
+    "fastembed>=0.7,<1.0",
+    # Pulled in transitively via fastmcp -> mcp; floor to clear GHSA-4xgf-cpjx-pc3j.
+    "pydantic-settings>=2.14.2",
+    # Pulled in transitively via fastmcp -> authlib; floor to clear CVE-2026-48990.
+    "joserfc>=1.6.7",
+    # Pulled in transitively via fastmcp -> typer/uvicorn; floor to clear
+    # PYSEC-2026-2132.
+    "click>=8.3.3",
+    # Pulled in transitively via fastmcp -> rich; floor to clear PYSEC-2026-2987.
+    "pygments>=2.20.0",
+    "httpx>=0.27.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.0",
+    # Floor to clear PYSEC-2026-2253..2257 / 3451..3453 (dev-only; not shipped
+    # at runtime — image extraction uses PyMuPDF, not Pillow).
+    "pillow>=12.3.0",
+    "mypy>=1.8.0",
+    "flake8>=7.0",
+    "black>=26.3.1",
+    "pip-audit>=2.7.0",
+    # Pulled in transitively via pip-audit -> pip-api; pin to clear PYSEC-2026-196.
+    "pip>=26.1.2",
+    # Pulled in transitively via pip-audit -> cachecontrol; floor to clear
+    # GHSA-6v7p-g79w-8964 (dev/build-time only, not shipped at runtime).
+    "msgpack>=1.2.1",
+    "pre-commit>=3.5",
+    # Column-aware extraction tests need the real detector; reference the
+    # extra so its version floor lives in one place (see `multicolumn`).
+    "pdf-mcp[multicolumn]",
+    # Parses docker-compose.yml in tests/test_docker_contract.py. Present
+    # transitively today via pre-commit; declared so the contract test
+    # cannot silently skip when that changes.
+    "pyyaml>=6.0",
+]
+
+# No-op compatibility alias: fastembed is a core dependency now.
+# Kept so existing install instructions ('pdf-mcp[semantic]') keep working.
+semantic = []
+
+# No-op compatibility alias (see semantic): CJK keyword AND semantic search
+# both work in the default install.
+cjk = []
+
+# Column-aware reading order for multi-column PDFs. Optional because it pulls
+# pymupdf_layout/onnxruntime; without it, extraction gracefully falls back to
+# the positional-sort path (which interleaves columns on multi-column pages).
+multicolumn = [
+    # <1.28: importing pymupdf4llm 1.28.0 auto-activates pymupdf.layout, which
+    # breaks find_tables() process-wide (tables come back with empty cells and
+    # Table.bbox raises ValueError). Lift the cap once fixed upstream.
+    "pymupdf4llm>=1.24.0,<1.28",
+]
+
+[project.urls]
+Homepage = "https://github.com/jztan/pdf-mcp"
+Documentation = "https://github.com/jztan/pdf-mcp#readme"
+Repository = "https://github.com/jztan/pdf-mcp"
+Issues = "https://github.com/jztan/pdf-mcp/issues"
+Changelog = "https://github.com/jztan/pdf-mcp/blob/master/CHANGELOG.md"
+
+[project.scripts]
+pdf-mcp = "pdf_mcp.server:main"
+pdf-mcp-http = "pdf_mcp.server:main_http"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+filterwarnings = [
+    "ignore::DeprecationWarning:importlib",
+    "ignore:builtin type Swig:DeprecationWarning",
+]
+markers = [
+    "integration: end-to-end tests requiring system dependencies (e.g. Tesseract)",
+    "slow: billed and/or multi-minute tests excluded from the release gate (e.g. the claude-CLI coherence eval)",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "pymupdf"
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+module = "fastembed"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pymupdf4llm"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pymupdf4llm.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pdf_mcp.extractor", "pdf_mcp.server", "pdf_mcp.embedder"]
+disallow_untyped_calls = false
+warn_unused_ignores = false

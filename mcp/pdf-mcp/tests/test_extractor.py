@@ -1,0 +1,646 @@
+# tests/test_extractor.py
+"""Tests for pdf_mcp.extractor module - edge cases and uncovered functions."""
+
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+import pymupdf
+
+import pdf_mcp.extractor as extractor
+from pdf_mcp.extractor import (
+    parse_page_range,
+    extract_text_from_page,
+    extract_text_with_coordinates,
+    extract_images_from_page,
+    extract_tables_from_page,
+    chunk_text,
+    is_confidently_single_column,
+)
+
+
+class TestParsePageRangeEdgeCases:
+    """Edge case tests for parse_page_range function."""
+
+    def test_empty_parts_ignored(self):
+        """Input with empty parts like '1,,3' should ignore empty parts."""
+        # Covers line 49: if not part: continue
+        result = parse_page_range("1,,3", 10)
+        assert result == [0, 2]  # 1-indexed input → 0-indexed output
+
+    def test_whitespace_handling(self):
+        """Input with extra whitespace should be handled."""
+        # Covers line 44: re.split(r'[,\s]+', pages.strip())
+        result = parse_page_range("  1  ,  3  ", 10)
+        assert result == [0, 2]
+
+    def test_invalid_string_ignored(self):
+        """Non-numeric strings like 'abc' should be ignored."""
+        # Covers lines 66-67: except ValueError: continue
+        result = parse_page_range("1,abc,3", 10)
+        assert result == [0, 2]
+
+    def test_invalid_range_ignored(self):
+        """Invalid ranges like '1-a' or 'a-5' should be ignored."""
+        # Covers line 53-54: regex match fails, match is None
+        result = parse_page_range("1-a,2,a-5", 10)
+        assert result == [1]  # Only "2" is valid → 0-indexed = 1
+
+
+class TestChunkText:
+    """Tests for chunk_text function."""
+
+    def test_empty_text_returns_empty_list(self):
+        """Empty input returns empty list."""
+        result = chunk_text("")
+        assert result == []
+
+    def test_short_text_single_chunk(self):
+        """Text shorter than max_tokens returns single chunk."""
+        text = "Hello world."
+        result = chunk_text(text, max_tokens=1000)
+
+        assert len(result) == 1
+        assert result[0]["text"] == text
+        assert result[0]["chunk_index"] == 0
+        assert result[0]["start_char"] == 0
+        assert result[0]["end_char"] == len(text)
+
+    def test_chunk_structure(self):
+        """Each chunk has required fields."""
+        text = "Test sentence one. Test sentence two."
+        result = chunk_text(text, max_tokens=1000)
+
+        chunk = result[0]
+        assert "chunk_index" in chunk
+        assert "text" in chunk
+        assert "start_char" in chunk
+        assert "end_char" in chunk
+        assert "estimated_tokens" in chunk
+
+    def test_basic_chunking(self):
+        """Long text is split into multiple chunks."""
+        # Create text that exceeds max_tokens (4 chars per token)
+        # 100 tokens = 400 chars, so 500 chars should create 2+ chunks
+        text = "Word. " * 100  # ~600 chars
+        result = chunk_text(text, max_tokens=100, overlap_tokens=10)
+
+        assert len(result) >= 2
+        # Verify chunks cover the text
+        assert result[0]["start_char"] == 0
+        assert result[-1]["end_char"] == len(text)
+
+    def test_overlap_between_chunks(self):
+        """Chunks have overlapping content."""
+        text = "A" * 2000  # Long enough for multiple chunks
+        result = chunk_text(text, max_tokens=200, overlap_tokens=50)
+
+        if len(result) >= 2:
+            # Second chunk should start before first chunk ends
+            # overlap_chars = 50 * 4 = 200
+            first_end = result[0]["end_char"]
+            second_start = result[1]["start_char"]
+            assert second_start < first_end  # Overlap exists
+
+    def test_sentence_boundary_breaking(self):
+        """Chunks prefer to break at sentence boundaries."""
+        # Create text with clear sentence boundaries
+        sentences = [
+            "This is sentence one. ",
+            "This is sentence two. ",
+            "This is sentence three.",
+        ]
+        text = "".join(sentences * 10)
+
+        result = chunk_text(text, max_tokens=50, overlap_tokens=5)
+
+        # Check that at least some chunks end with sentence-ending punctuation
+        sentence_endings = sum(
+            1 for c in result if c["text"].rstrip().endswith((".", "!", "?"))
+        )
+        assert sentence_endings > 0
+
+
+class TestExtractTextWithCoordinates:
+    """Tests for extract_text_with_coordinates function."""
+
+    def test_returns_list(self, sample_pdf):
+        """Function returns a list."""
+        doc = pymupdf.open(sample_pdf)
+        page = doc[0]
+
+        result = extract_text_with_coordinates(page)
+
+        assert isinstance(result, list)
+        doc.close()
+
+    def test_text_block_structure(self, sample_pdf):
+        """Text blocks have required fields: type, text, y, bbox."""
+        doc = pymupdf.open(sample_pdf)
+        page = doc[0]
+
+        result = extract_text_with_coordinates(page)
+
+        # Find a text block
+        text_blocks = [b for b in result if b["type"] == "text"]
+        assert len(text_blocks) > 0
+
+        block = text_blocks[0]
+        assert block["type"] == "text"
+        assert "text" in block
+        assert "y" in block
+        assert "bbox" in block
+        assert isinstance(block["bbox"], (list, tuple))
+        assert len(block["bbox"]) == 4
+
+        doc.close()
+
+    def test_sorted_by_y_coordinate(self, sample_pdf):
+        """Results are sorted by Y coordinate."""
+        doc = pymupdf.open(sample_pdf)
+        page = doc[0]
+
+        result = extract_text_with_coordinates(page)
+
+        if len(result) >= 2:
+            y_values = [block["y"] for block in result]
+            assert y_values == sorted(y_values)
+
+        doc.close()
+
+    def test_empty_page_returns_empty_list(self):
+        """Empty page returns empty list."""
+        doc = pymupdf.open()
+        page = doc.new_page()
+
+        result = extract_text_with_coordinates(page)
+
+        assert result == []
+        doc.close()
+
+    def test_image_placeholder_structure(self, sample_pdf_with_images):
+        """Image blocks have type 'image_placeholder'."""
+        doc = pymupdf.open(sample_pdf_with_images)
+        page = doc[0]
+
+        result = extract_text_with_coordinates(page)
+
+        # Check for image placeholders
+        image_blocks = [b for b in result if b["type"] == "image_placeholder"]
+
+        for block in image_blocks:
+            assert "y" in block
+            assert "bbox" in block
+
+        doc.close()
+
+
+class TestExtractImagesFromPage:
+    """Tests for extract_images_from_page."""
+
+    def test_rgb_image_output_structure(self, sample_pdf_with_images, tmp_path):
+        """Extracted images are saved to disk with correct metadata."""
+        doc = pymupdf.open(sample_pdf_with_images)
+        images = extract_images_from_page(
+            doc, 0, output_dir=tmp_path, pdf_hash="abc123"
+        )
+        doc.close()
+
+        assert len(images) >= 1
+        img = images[0]
+        assert img["page"] == 1  # 1-indexed
+        assert img["index"] == 0
+        assert isinstance(img["width"], int)
+        assert isinstance(img["height"], int)
+        assert img["width"] > 0
+        assert img["height"] > 0
+        assert img["format"] in ("rgb", "rgba", "grayscale")
+        # File path instead of base64 data
+        assert "path" in img
+        assert "data" not in img
+        path = Path(img["path"])
+        assert path.exists()
+        assert path.suffix == ".png"
+        # Valid PNG magic bytes
+        assert path.read_bytes()[:4] == b"\x89PNG"
+        # File size in bytes
+        assert "size_bytes" in img
+        assert isinstance(img["size_bytes"], int)
+        assert img["size_bytes"] > 0
+        assert img["size_bytes"] == path.stat().st_size
+        # Secure permissions
+        assert oct(path.stat().st_mode & 0o777) == oct(0o600)
+
+    def test_deterministic_filenames(self, sample_pdf_with_images, tmp_path):
+        """Same inputs produce the same file path."""
+        doc = pymupdf.open(sample_pdf_with_images)
+        images1 = extract_images_from_page(
+            doc, 0, output_dir=tmp_path, pdf_hash="det123"
+        )
+        images2 = extract_images_from_page(
+            doc, 0, output_dir=tmp_path, pdf_hash="det123"
+        )
+        doc.close()
+
+        assert len(images1) >= 1
+        assert images1[0]["path"] == images2[0]["path"]
+        # Filename format: {pdf_hash}_p{page}_i{index}.png
+        assert "det123_p0_i0.png" in images1[0]["path"]
+
+    def test_grayscale_format(self, sample_pdf_grayscale, tmp_path):
+        """Grayscale images report 'grayscale' format."""
+        doc = pymupdf.open(sample_pdf_grayscale)
+        images = extract_images_from_page(doc, 0, output_dir=tmp_path, pdf_hash="gs")
+        doc.close()
+
+        assert len(images) >= 1
+        assert images[0]["format"] == "grayscale"
+
+    def test_rgba_format(self, sample_pdf_rgba, tmp_path):
+        """RGBA images report 'rgba' format."""
+        doc = pymupdf.open(sample_pdf_rgba)
+        images = extract_images_from_page(doc, 0, output_dir=tmp_path, pdf_hash="rgba")
+        doc.close()
+
+        assert len(images) >= 1
+        assert images[0]["format"] in ("rgba", "rgb")
+
+    def test_no_images_returns_empty_list(self, sample_pdf, tmp_path):
+        """PDF with no images returns an empty list."""
+        doc = pymupdf.open(sample_pdf)
+        images = extract_images_from_page(doc, 0, output_dir=tmp_path, pdf_hash="empty")
+        doc.close()
+
+        assert images == []
+
+    def test_duplicate_xref_deduped_to_single_entry(
+        self, sample_pdf_dup_image, tmp_path
+    ):
+        """One image placed twice -> one entry (index 0) and one PNG on disk."""
+        doc = pymupdf.open(sample_pdf_dup_image)
+        raw = doc[0].get_images(full=True)
+        # Fixture sanity: two placements, one distinct xref.
+        assert len(raw) == 2
+        assert len({info[0] for info in raw}) == 1
+        images = extract_images_from_page(doc, 0, output_dir=tmp_path, pdf_hash="dup")
+        doc.close()
+        assert len(images) == 1
+        assert images[0]["index"] == 0
+        assert len(list(tmp_path.glob("*.png"))) == 1
+
+    def test_distinct_images_not_deduped(
+        self, sample_pdf_two_distinct_images, tmp_path
+    ):
+        """Two different images are both kept with compacted indices 0 and 1."""
+        doc = pymupdf.open(sample_pdf_two_distinct_images)
+        raw = doc[0].get_images(full=True)
+        assert len({info[0] for info in raw}) == 2
+        images = extract_images_from_page(doc, 0, output_dir=tmp_path, pdf_hash="two")
+        doc.close()
+        assert len(images) == 2
+        assert [img["index"] for img in images] == [0, 1]
+        assert len(list(tmp_path.glob("*.png"))) == 2
+
+    def test_extract_images_single_placement_bbox(
+        self, sample_pdf_with_images, tmp_path
+    ):
+        """Single-placement image gets a bbox but no placements list."""
+        doc = pymupdf.open(sample_pdf_with_images)
+        imgs = extract_images_from_page(doc, 0, output_dir=tmp_path, pdf_hash="h")
+        doc.close()
+        assert imgs
+        img = imgs[0]
+        assert "bbox" in img and len(img["bbox"]) == 4
+        # inserted at Rect(50,50,80,80)
+        assert abs(img["bbox"][0] - 50) < 2 and abs(img["bbox"][1] - 50) < 2
+        assert "placements" not in img  # single placement
+
+    def test_extract_images_multi_placement(self, sample_pdf_dup_image, tmp_path):
+        """Multi-placement image gets both bbox (first) and placements list."""
+        doc = pymupdf.open(sample_pdf_dup_image)
+        imgs = extract_images_from_page(doc, 0, output_dir=tmp_path, pdf_hash="h")
+        doc.close()
+        assert len(imgs) == 1  # deduped by xref
+        img = imgs[0]
+        assert "bbox" in img
+        assert "placements" in img and len(img["placements"]) == 2
+
+    def test_cmyk_image_converted_to_rgb(self, tmp_path):
+        """CMYK images are converted to RGB colorspace."""
+        from PIL import Image
+        import io
+
+        with pymupdf.open() as doc:
+            page = doc.new_page()
+
+            # Create a CMYK image
+            img = Image.new("CMYK", (20, 20), color=(0, 100, 200, 50))
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format="TIFF")
+            img_bytes.seek(0)
+
+            page.insert_image(pymupdf.Rect(50, 50, 100, 100), stream=img_bytes.read())
+
+            images = extract_images_from_page(
+                doc, 0, output_dir=tmp_path, pdf_hash="cmyk"
+            )
+
+        assert len(images) >= 1
+        # After CMYK→RGB conversion, pix.n should be 3 → "rgb"
+        assert images[0]["format"] == "rgb"
+
+    def test_bad_xref_skipped_with_warning(
+        self, sample_pdf_with_images, tmp_path, caplog
+    ):
+        """Images that raise exceptions are skipped and logged."""
+        doc = pymupdf.open(sample_pdf_with_images)
+
+        with patch("pymupdf.Pixmap", side_effect=RuntimeError("corrupt")):
+            import logging
+
+            with caplog.at_level(logging.WARNING, logger="pdf_mcp.extractor"):
+                images = extract_images_from_page(
+                    doc, 0, output_dir=tmp_path, pdf_hash="bad"
+                )
+
+        doc.close()
+
+        assert images == []
+        assert "Failed to extract image" in caplog.text
+
+    def test_multiple_images_indexed(self, tmp_path):
+        """Multiple images on one page get sequential indices."""
+        from PIL import Image
+        import io
+
+        with pymupdf.open() as doc:
+            page = doc.new_page()
+
+            for i in range(3):
+                img = Image.new("RGB", (10, 10), color=(i * 80, 0, 0))
+                img_bytes = io.BytesIO()
+                img.save(img_bytes, format="PNG")
+                img_bytes.seek(0)
+                x = 50 + i * 40
+                page.insert_image(
+                    pymupdf.Rect(x, 50, x + 30, 80), stream=img_bytes.read()
+                )
+
+            images = extract_images_from_page(
+                doc, 0, output_dir=tmp_path, pdf_hash="multi"
+            )
+
+        assert len(images) == 3
+        for i, img in enumerate(images):
+            assert img["index"] == i
+            assert img["page"] == 1
+
+    def test_save_to_nonexistent_dir_skipped_with_warning(
+        self, sample_pdf_with_images, tmp_path, caplog
+    ):
+        """FzErrorSystem from pix.save() to nonexistent dir is caught and skipped."""
+        doc = pymupdf.open(sample_pdf_with_images)
+        nonexistent = tmp_path / "no_such_dir" / "subdir"  # does not exist
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="pdf_mcp.extractor"):
+            images = extract_images_from_page(
+                doc, 0, output_dir=nonexistent, pdf_hash="fz"
+            )
+        doc.close()
+        assert images == []
+        assert "Failed to save image" in caplog.text
+
+    def test_chmod_oserror_skipped_with_warning(
+        self, sample_pdf_with_images, tmp_path, caplog
+    ):
+        """OSError during os.chmod() is caught and image is skipped."""
+        doc = pymupdf.open(sample_pdf_with_images)
+        import logging
+
+        with patch("os.chmod", side_effect=OSError("permission denied")):
+            with caplog.at_level(logging.WARNING, logger="pdf_mcp.extractor"):
+                images = extract_images_from_page(
+                    doc, 0, output_dir=tmp_path, pdf_hash="err"
+                )
+        doc.close()
+        assert images == []
+        assert "Failed to save image" in caplog.text
+
+
+class TestExtractTextFromPageOptions:
+    """Tests for extract_text_from_page options."""
+
+    def test_sort_by_position_true_default(self, sample_pdf):
+        """Default behavior sorts by position."""
+        doc = pymupdf.open(sample_pdf)
+        page = doc[0]
+
+        text = extract_text_from_page(page)  # sort_by_position=True by default
+
+        assert len(text) > 0
+        assert "page 1" in text.lower()
+
+        doc.close()
+
+    def test_sort_by_position_false(self, sample_pdf):
+        """sort_by_position=False uses raw extraction."""
+        doc = pymupdf.open(sample_pdf)
+        page = doc[0]
+
+        text = extract_text_from_page(page, sort_by_position=False)
+
+        assert len(text) > 0
+        # Content should still be present
+        assert "page" in text.lower()
+
+        doc.close()
+
+
+class TestExtractTablesFromPage:
+    """Edge case tests for extract_tables_from_page."""
+
+    def test_skips_table_with_empty_extraction(self):
+        """Tables where extract() returns [] are silently skipped."""
+        mock_page = MagicMock()
+        mock_table = MagicMock()
+        mock_table.extract.return_value = []
+        mock_page.find_tables.return_value.tables = [mock_table]
+
+        result = extract_tables_from_page(mock_page)
+        assert result == []
+
+    def test_handles_find_tables_exception(self, caplog):
+        """Exception from find_tables() is caught and logged; returns []."""
+        import logging
+
+        mock_page = MagicMock()
+        mock_page.find_tables.side_effect = RuntimeError("PyMuPDF internal error")
+
+        with caplog.at_level(logging.WARNING, logger="pdf_mcp.extractor"):
+            result = extract_tables_from_page(mock_page)
+
+        assert result == []
+        assert "Failed to extract tables" in caplog.text
+
+    @staticmethod
+    def _page_with_tables(page_rect, tables):
+        page = MagicMock()
+        page.rect = page_rect
+        page.find_tables.return_value.tables = tables
+        return page
+
+    @staticmethod
+    def _table(bbox, extracted):
+        t = MagicMock()
+        t.bbox = bbox
+        t.extract.return_value = extracted
+        return t
+
+    def test_drops_full_page_false_positive_table(self):
+        """A 'table' spanning ~full page in both dimensions is a false positive.
+
+        Geometry taken from a real IBK vertical-JP academic page (419.5x595.3):
+        the table finder latched onto the whole body text block (82% wide,
+        88% tall) and emitted phantom columns of broken text. Drop it.
+        """
+        page_rect = pymupdf.Rect(0, 0, 419.5, 595.3)
+        fp = self._table(
+            [48.89, 41.76, 392.24, 565.46],
+            [["a", "b"], ["c", "d"]],
+        )
+        page = self._page_with_tables(page_rect, [fp])
+
+        assert extract_tables_from_page(page) == []
+
+    def test_keeps_normal_table_and_reindexes_after_drop(self):
+        """When a full-page false positive is dropped, surviving tables keep
+        sequential 0-based indices (no gaps)."""
+        page_rect = pymupdf.Rect(0, 0, 419.5, 595.3)
+        fp = self._table([48.89, 41.76, 392.24, 565.46], [["x"], ["y"]])
+        normal = self._table(
+            [50, 50, 250, 150],
+            [["Name", "Value"], ["Alpha", "1"]],
+        )
+        page = self._page_with_tables(page_rect, [fp, normal])
+
+        result = extract_tables_from_page(page)
+
+        assert len(result) == 1
+        assert result[0]["index"] == 0
+        assert result[0]["col_count"] == 2
+        assert result[0]["header"] == ["Name", "Value"]
+
+    def test_wide_but_short_table_kept(self):
+        """A table spanning 92% width but only 65% height is a real table
+        (matches AWS-cert corpus geometry); it must be kept."""
+        page_rect = pymupdf.Rect(0, 0, 612, 792)
+        wide = self._table(
+            [20, 100, 583, 615],
+            [["h1", "h2"], ["a", "b"]],
+        )
+        page = self._page_with_tables(page_rect, [wide])
+
+        assert len(extract_tables_from_page(page)) == 1
+
+    def test_real_bordered_table_not_dropped(self, sample_pdf_with_table):
+        """End-to-end guard: a genuine small bordered table survives the
+        full-page suppression heuristic."""
+        doc = pymupdf.open(sample_pdf_with_table)
+        try:
+            result = extract_tables_from_page(doc[0])
+        finally:
+            doc.close()
+
+        assert len(result) >= 1
+
+
+class TestIsSingleColumnConfident:
+    """Tests for is_confidently_single_column heuristic."""
+
+    @staticmethod
+    def _blk(x0, x1, text="body text here", btype=0):
+        return (x0, 100.0, x1, 120.0, text, 0, btype)
+
+    def test_full_width_blocks_are_single_column(self):
+        blocks = [self._blk(50, 500), self._blk(50, 500), self._blk(50, 490)]
+        assert is_confidently_single_column(blocks) is True
+
+    def test_two_narrow_bands_are_not_single_column(self):
+        # left band ~[50,250], right band ~[300,500]; each ~200 of 450 width = 0.44
+        blocks = [
+            self._blk(50, 250),
+            self._blk(50, 250),
+            self._blk(300, 500),
+            self._blk(300, 500),
+        ]
+        assert is_confidently_single_column(blocks) is False
+
+    def test_too_few_blocks_is_conservative_false(self):
+        assert is_confidently_single_column([self._blk(50, 500)]) is False
+
+    def test_image_blocks_are_ignored(self):
+        blocks = [
+            self._blk(50, 500),
+            self._blk(50, 500),
+            self._blk(0, 9999, "", btype=1),
+        ]
+        assert is_confidently_single_column(blocks) is True
+
+    def test_majority_full_width_with_one_short_caption_is_single_column(self):
+        # 3 full-width body blocks + 1 short TEXT caption: 3/4 = 0.75 >= 0.6 -> True
+        blocks = [
+            self._blk(50, 500),
+            self._blk(50, 500),
+            self._blk(50, 500),
+            self._blk(50, 120),
+        ]
+        assert is_confidently_single_column(blocks) is True
+
+
+class TestExtractTextFromPageWiring:
+    """Tests that the confident-single-column pre-gate is wired correctly."""
+
+    def test_confident_single_column_skips_detector(self, sample_pdf):
+        import pymupdf
+
+        doc = pymupdf.open(sample_pdf)
+        page = doc[0]
+        with (
+            patch.object(extractor, "is_confidently_single_column", return_value=True),
+            patch.object(extractor, "detect_column_boxes") as detector,
+        ):
+            text = extractor.extract_text_from_page(page)
+        detector.assert_not_called()
+        assert text.strip()
+        doc.close()
+
+    def test_ambiguous_page_still_calls_detector(self, sample_pdf):
+        import pymupdf
+
+        doc = pymupdf.open(sample_pdf)
+        page = doc[0]
+        with (
+            patch.object(extractor, "is_confidently_single_column", return_value=False),
+            patch.object(extractor, "detect_column_boxes", return_value=[]) as detector,
+        ):
+            extractor.extract_text_from_page(page)
+        detector.assert_called_once()
+        doc.close()
+
+
+def test_block_bbox_for_index_matches_block_enumeration():
+    import pymupdf
+    from pdf_mcp.extractor import block_bbox_for_index
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 120), "First paragraph block with enough text here.")
+    page.insert_text((72, 400), "Second paragraph block sitting lower on page.")
+
+    blocks = [b for b in page.get_text("blocks", sort=True) if b[6] == 0]
+    expected = tuple(round(v, 1) for v in blocks[1][:4])
+
+    assert block_bbox_for_index(page, 1) == expected
+    assert block_bbox_for_index(page, 99) is None
+    assert block_bbox_for_index(page, -1) is None
+    doc.close()
