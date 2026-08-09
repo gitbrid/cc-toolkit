@@ -8,7 +8,7 @@
 
 - 链接：<https://github.com/firecrawl/anydoc>
 - 语言：Rust
-- Stars：12429
+- Stars：12430
 - 创建时间：2026-08-03T16:36:14Z
 - Topics：无
 
@@ -28,7 +28,7 @@ Python 技术栈，适合做脚本、自动化或工具扩展；与 Obsidian/笔
 
 - 链接：<https://github.com/KKKKhazix/human-writing>
 - 语言：Python
-- Stars：2043
+- Stars：2044
 - 创建时间：2026-08-05T01:19:41Z
 - Topics：agent-skills, chinese-writing, creative-writing, writing-skill
 
@@ -48,7 +48,7 @@ AI/LLM 方向，可能对你的 Agent 工具链有直接参考价值；Python �
 
 - 链接：<https://github.com/ZzzLc0405/photo-abstract-editorial>
 - 语言：未标注
-- Stars：1868
+- Stars：1869
 - 创建时间：2026-08-04T09:35:31Z
 - Topics：无
 
@@ -88,7 +88,7 @@ AI/LLM 方向，可能对你的 Agent 工具链有直接参考价值；浏览器
 
 - 链接：<https://github.com/mikiarlo3/awesome-growth-hacking-skills>
 - 语言：Shell
-- Stars：781
+- Stars：778
 - 创建时间：2026-08-04T19:45:15Z
 - Topics：无
 
@@ -128,7 +128,7 @@ claude-red is a curated library of offensive security skills designed for the Cl
 
 - 链接：<https://github.com/google-gemma/gemma-translator>
 - 语言：JavaScript
-- Stars：640
+- Stars：641
 - 创建时间：2026-08-03T18:50:34Z
 - Topics：无
 
@@ -148,7 +148,7 @@ claude-red is a curated library of offensive security skills designed for the Cl
 
 - 链接：<https://github.com/wumingqi60/lingxi>
 - 语言：TypeScript
-- Stars：629
+- Stars：630
 - 创建时间：2026-08-03T05:46:34Z
 - Topics：无
 
@@ -188,7 +188,7 @@ Racing to the bottom of CPU performance
 
 - 链接：<https://github.com/yuhuangerdi/InduSecAgent>
 - 语言：Vue
-- Stars：587
+- Stars：588
 - 创建时间：2026-08-03T10:17:31Z
 - Topics：无
 
