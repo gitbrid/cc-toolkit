@@ -2,6 +2,7 @@ import argparse
 import datetime
 import os
 import sys
+import time
 
 from dates import week_ranges, month_label
 from github_api import search_new_repos, get_repo, get_readme_text
@@ -54,6 +55,7 @@ def run_backfill(start, end, top, max_count, token, output_root, data_dir, with_
                 month_cache[month_key] = _collect_new(ms, me, top, max_count, token, with_readme)
             write_week_folder(output_root, ws, we, weekly, month_cache[month_key])
             total += 1
+            time.sleep(7)
         except Exception as e:
             _log_failure(data_dir, f"backfill week {ws}..{we}: {e}")
     return total
