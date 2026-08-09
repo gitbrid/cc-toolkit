@@ -163,3 +163,7 @@
 | 2026-08-09 | 新增 DeepSeek 工具集：DeepSeekHelper、DeepSeek MCP Server、DeepSeek Vision，见 [deepseek-tools-介绍.md](./deepseek-tools-介绍.md) |
 | 2026-08-09 | 第二批：rag-mcp-server、pdf-mcp、the-learning-skill、obsidian-deepseek-note-helper 收录 |
 | 2026-08-09 | 本地 OCR：便携 Tesseract（chi_sim/eng/osd）+ deepseek-vision 本地兜底，更新全部 DeepSeek key |
+
+## GitHub 热点归档（2026-08-09 新增）
+
+新增 [github-trending-介绍.md](./github-trending-介绍.md)：每周自动收集 GitHub 热点项目（周榜/月榜，三种口径 Top 10-15），归档为 Obsidian 库 `github-trending/`，并已补录 2026-01-01 至今共 32 周。

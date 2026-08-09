@@ -31,7 +31,8 @@ CC 工具库/
 │   ├── custom-agents/           ← 自定义Agent (4个中文Agent)
 │   └── the-learning-skill/      ← 学习教练技能（toddward，2026-08-09收录）
 ├── plugins/                     ← Codex / Obsidian 插件源码（deepseekhelper / deepseek-vision / obsidian-deepseek-note-helper）
-├── tools/                       ← 便携工具（tesseract-portable 本地 OCR）
+├── github-trending/             ← GitHub 每周热点 Obsidian 库（Obsidian 直接打开此文件夹）
+├── tools/                       ← 便携工具与脚本（tesseract-portable / github-trending 收集脚本）
 └── mcp/                         ← MCP 收藏子库
     └── README.md                ← MCP 推荐清单与收藏索引
 ```
@@ -74,6 +75,7 @@ CC 工具库/
 | 本地 PDF/文档库语义检索 | mcp/README 的「本地 RAG」→ [docs/rag-mcp-介绍.md](docs/rag-mcp-介绍.md) |
 | 图片 / 扫描 PDF 文字提取 | deepseek-vision 的本地 OCR 兜底（`scripts/local_ocr.py` + 便携 Tesseract） |
 | 从 GitHub 找好项目 | 本项目的 `github-discovery` 技能 |
+| 每周看 GitHub 热点 | 本项目 `github-trending/` 归档 + `tools/github-trending` 收集脚本 |
 
 ## 如何给其他项目安装技能
 
