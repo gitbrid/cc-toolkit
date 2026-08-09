@@ -8,7 +8,7 @@
 
 - 链接：<https://github.com/firecrawl/anydoc>
 - 语言：Rust
-- Stars：12426
+- Stars：12429
 - 创建时间：2026-08-03T16:36:14Z
 - Topics：无
 
@@ -18,7 +18,7 @@ Convert Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV, and PDF to clean 
 
 **你可能用到**
 
-Python 技术栈，适合做脚本、自动化或工具扩展；与 Obsidian/笔记/知识管理相关，可直接借鉴或集成。
+Python 技术栈，适合做脚本、自动化或工具扩展；与 Obsidian/笔记/知识管理相关，可直接借鉴或集成；文档/办公处理方向，和你的 PDF、Word、Excel 工具链相关。
 
 ---
 
@@ -48,7 +48,7 @@ AI/LLM 方向，可能对你的 Agent 工具链有直接参考价值；Python �
 
 - 链接：<https://github.com/ZzzLc0405/photo-abstract-editorial>
 - 语言：未标注
-- Stars：1867
+- Stars：1868
 - 创建时间：2026-08-04T09:35:31Z
 - Topics：无
 
@@ -78,7 +78,7 @@ AI/LLM 方向，可能对你的 Agent 工具链有直接参考价值；Python �
 
 **你可能用到**
 
-AI/LLM 方向，可能对你的 Agent 工具链有直接参考价值。
+AI/LLM 方向，可能对你的 Agent 工具链有直接参考价值；浏览器自动化方向，可对照你的浏览器自动化技能使用。
 
 ---
 
@@ -88,7 +88,7 @@ AI/LLM 方向，可能对你的 Agent 工具链有直接参考价值。
 
 - 链接：<https://github.com/mikiarlo3/awesome-growth-hacking-skills>
 - 语言：Shell
-- Stars：780
+- Stars：781
 - 创建时间：2026-08-04T19:45:15Z
 - Topics：无
 
@@ -98,7 +98,7 @@ Find agentic growth hacking skills for Claude, ChatGPT, Manus | by enso.bot
 
 **你可能用到**
 
-AI/LLM 方向，可能对你的 Agent 工具链有直接参考价值。
+AI/LLM 方向，可能对你的 Agent 工具链有直接参考价值；安全研究向项目，适合评估是否纳入你的安全技能库。
 
 ---
 
@@ -118,7 +118,7 @@ claude-red is a curated library of offensive security skills designed for the Cl
 
 **你可能用到**
 
-值得关注的新项目，建议按文档判断是否适合你的工作流。
+安全研究向项目，适合评估是否纳入你的安全技能库；数据/检索方向，可对照你的本地 RAG 知识库评估。
 
 ---
 
@@ -168,7 +168,7 @@ claude-red is a curated library of offensive security skills designed for the Cl
 
 - 链接：<https://github.com/xoreaxeaxeax/asm-hall-of-shame>
 - 语言：C
-- Stars：593
+- Stars：594
 - 创建时间：2026-08-06T00:08:06Z
 - Topics：无
 
@@ -228,7 +228,7 @@ AI/LLM 方向，可能对你的 Agent 工具链有直接参考价值；与 Obsid
 
 - 链接：<https://github.com/jd-opensource/JoyAI-Video-Edit>
 - 语言：Python
-- Stars：557
+- Stars：558
 - 创建时间：2026-08-04T08:22:24Z
 - Topics：无
 
@@ -268,7 +268,7 @@ AI/LLM 方向，可能对你的 Agent 工具链有直接参考价值。
 
 - 链接：<https://github.com/T8mars/comfyui-minimax-h3-audio-T8>
 - 语言：Python
-- Stars：504
+- Stars：505
 - 创建时间：2026-08-05T15:30:15Z
 - Topics：无
 
@@ -288,7 +288,7 @@ Python 技术栈，适合做脚本、自动化或工具扩展。
 
 - 链接：<https://github.com/openTrinity/mycontext>
 - 语言：TypeScript
-- Stars：476
+- Stars：477
 - 创建时间：2026-08-03T15:08:51Z
 - Topics：无
 
