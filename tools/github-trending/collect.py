@@ -83,19 +83,25 @@ def run_week(week_start, top, max_count, token, output_root, data_dir, with_read
     try:
         prev = load_snapshot(os.path.join(data_dir, "star_snapshot.json"))
         current = {p["full_name"]: p.get("stargazers_count", 0) for p in weekly["new_star"][:50]}
+        repo_info = {p["full_name"]: p for p in weekly["new_star"][:50]}
         for repo in prev:
             if repo not in current:
                 try:
                     owner, name = repo.split("/", 1)
-                    current[repo] = get_repo(owner, name, token).get("stargazers_count", 0)
+                    info = get_repo(owner, name, token)
+                    current[repo] = info.get("stargazers_count", 0)
+                    repo_info[repo] = info
                 except Exception:
                     continue
         deltas = update_snapshot(prev, current)
         save_snapshot(os.path.join(data_dir, "star_snapshot.json"), current)
-        growth = [
-            {"name": k, "stargazers_count": v["stars"], "delta": v["delta"]}
-            for k, v in sorted(deltas.items(), key=lambda x: -x[1]["delta"])
-        ]
+        growth = []
+        for repo, v in sorted(deltas.items(), key=lambda x: -x[1]["delta"]):
+            item = dict(repo_info.get(repo, {}))
+            item["name"] = repo
+            item["stargazers_count"] = v["stars"]
+            item["delta"] = v["delta"]
+            growth.append(item)
         if any(v["delta"] > 0 for v in deltas.values()):
             weekly["star_delta"] = growth[:max_count]
     except Exception as e:
