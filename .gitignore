@@ -20,6 +20,9 @@ __pycache__/
 # Obsidian 本地配置
 /github-trending/.obsidian/
 
+# Playwright MCP 临时截图/快照
+/.playwright-mcp/
+
 # 便携工具二进制
 /tools/tesseract-portable/
 

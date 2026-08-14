@@ -31,8 +31,11 @@ CC 工具库/
 │   ├── custom-agents/           ← 自定义Agent (4个中文Agent)
 │   └── the-learning-skill/      ← 学习教练技能（toddward，2026-08-09收录）
 ├── plugins/                     ← Codex / Obsidian 插件源码（deepseekhelper / deepseek-vision / obsidian-deepseek-note-helper）
-└── mcp/                         ← MCP 收藏子库
-    └── README.md                ← MCP 推荐清单与收藏索引
+├── mcp/                         ← MCP 收藏子库
+│   └── README.md                ← MCP 推荐清单与收藏索引
+└── tools/                       ← 独立可执行工具收藏
+    ├── deepseek-harness/        ← DeepSeek 官方 agent harness `dsh`（已装好构建）
+    └── tesseract-portable/      ← 便携 Tesseract OCR（免管理员）
 ```
 
 ## 技能清单速览

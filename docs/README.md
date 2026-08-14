@@ -163,6 +163,14 @@
 | 2026-08-09 | 新增 DeepSeek 工具集：DeepSeekHelper、DeepSeek MCP Server、DeepSeek Vision，见 [deepseek-tools-介绍.md](./deepseek-tools-介绍.md) |
 | 2026-08-09 | 第二批：rag-mcp-server、pdf-mcp、the-learning-skill、obsidian-deepseek-note-helper 收录 |
 | 2026-08-09 | 本地 OCR：便携 Tesseract（chi_sim/eng/osd）+ deepseek-vision 本地兜底，更新全部 DeepSeek key |
+| 2026-08-15 | 新增 Agent 框架：deepseek-harness（DeepSeek 官方 dsh，`tools/` 下完整安装构建），见 [deepseek-harness-介绍.md](./deepseek-harness-介绍.md) |
+
+## Agent 框架（2026-08-15 新增）✅
+
+**[deepseek-harness](./deepseek-harness-介绍.md)** — DeepSeek 官方开源的 agent harness（`dsh`），"一切皆插件"架构 + Cordis 驱动，带 Web UI / headless / CLI，含 Python SDK：
+- 已完整安装构建：`tools/deepseek-harness`，`pnpm dsh web` 启动 Web UI（默认 `http://127.0.0.1:3080`）
+- 免源码方式：`npx @deepseek-ai/dsh web`
+- 处于 developer preview，升级注意破坏性变更
 
 ## GitHub 热点归档（2026-08-09 新增）
 
