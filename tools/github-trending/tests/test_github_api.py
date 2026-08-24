@@ -1,8 +1,10 @@
 import json
+import urllib.error
 import unittest
+from email.message import Message
 from unittest import mock
 
-from github_api import search_new_repos, get_repo, get_readme_text
+from github_api import GitHubRateLimitError, search_new_repos, get_repo, get_readme_text, _request
 
 
 class TestGitHubApi(unittest.TestCase):
@@ -27,6 +29,14 @@ class TestGitHubApi(unittest.TestCase):
             m.return_value.__enter__.return_value.read.return_value = json.dumps(payload).encode()
             result = get_readme_text("a", "b")
         self.assertIn("world", result)
+
+    def test_request_fails_fast_on_rate_limit(self):
+        headers = Message()
+        headers["X-RateLimit-Remaining"] = "0"
+        err = urllib.error.HTTPError("https://api.github.com/x", 403, "Forbidden", headers, None)
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(GitHubRateLimitError):
+                _request("https://api.github.com/x")
 
 
 if __name__ == "__main__":

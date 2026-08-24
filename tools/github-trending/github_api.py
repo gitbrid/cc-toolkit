@@ -23,6 +23,8 @@ def _request(url, token=None, retries=3):
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code in (403, 429):
+                if e.code == 403 and e.headers.get("X-RateLimit-Remaining", "") == "0":
+                    raise GitHubRateLimitError(f"rate limited: {url}")
                 time.sleep(8 * (attempt + 1))
                 continue
             raise

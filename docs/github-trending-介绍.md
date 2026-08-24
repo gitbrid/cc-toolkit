@@ -40,7 +40,7 @@ $PY = "C:\Users\subrid\.cache\codex-runtimes\codex-primary-runtime\dependencies\
 & $PY "D:\program\CC 工具库\tools\github-trending\collect.py" --backfill --start 2026-01-01 --end 2026-08-09 --max 15
 ```
 
-可选参数：`--max` 控制榜单最大数量（默认 15）、`--top` 控制基准数量（默认 10）、`--token` 传入 GitHub Token（也可用环境变量 `GITHUB_TOKEN`）、`--with-readme` 抓取 README 摘要（会增加 API 请求，历史补录默认关闭以规避匿名限速）。
+可选参数：`--max` 控制榜单最大数量（默认 15）、`--top` 控制基准数量（默认 10）、`--token` 传入 GitHub Token（也可用环境变量 `GITHUB_TOKEN`）、`--with-readme` 抓取 README 摘要（会增加 API 请求；无 Token 时历史补录和每周任务均默认关闭，避免匿名限速拖慢或失败）。
 
 ## 每周自动化
 
@@ -54,7 +54,7 @@ $PY = "C:\Users\subrid\.cache\codex-runtimes\codex-primary-runtime\dependencies\
 - Codex 应用内创建每周自动任务：每周一 09:00 运行 `D:\program\CC 工具库\tools\github-trending\run-weekly.bat`。
 - Windows 任务计划程序：新建每周任务，操作指向 `run-weekly.bat`，时间为每周一 09:00。
 
-2026-08-09 已创建 Windows 计划任务：`CC-Toolkit-GitHubTrendingWeekly`，每周一 09:00 自动运行，当前用户交互式登录。任务创建后生成的 `raw-data.json` 可由 Codex 按需润色介绍与推荐，再提交归档。
+2026-08-09 已创建 Windows 计划任务：`CC-Toolkit-GitHubTrendingWeekly`，每周一 09:00 自动运行，当前用户交互式登录；2026-08-24 起启用「错过补跑」，周一 09:00 未登录时会在下次登录后自动补跑。任务输出记录在 `tools/github-trending/data/task-output.log`。生成的 `raw-data.json` 可由 Codex 按需润色介绍与推荐，再提交归档。
 
 ## 脚本结构
 

@@ -72,7 +72,9 @@ def run_backfill(start, end, top, max_count, token, output_root, data_dir, with_
     return total
 
 
-def run_week(week_start, top, max_count, token, output_root, data_dir, with_readme=True):
+def run_week(week_start, top, max_count, token, output_root, data_dir, with_readme=None):
+    if with_readme is None:
+        with_readme = bool(token)
     ws = week_start
     we = ws + datetime.timedelta(days=6)
     weekly = {"new_star": _collect_new(ws, we, top, max_count, token, with_readme)}

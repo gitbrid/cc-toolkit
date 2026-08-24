@@ -27,3 +27,10 @@
 
 - 2026-08-09 已创建 Windows 计划任务 `CC-Toolkit-GitHubTrendingWeekly`：每周一 09:00 运行 `tools/github-trending/run-weekly.bat`，当前用户交互式登录。
 - 当前 Codex 会话没有 automation 工具，Codex 应用内每周任务暂未创建；如后续可用再替换为 Codex 自动化并润色介绍。
+
+## 2026-08-24 排障记录
+
+- 周一 09:00 未执行：任务使用 InteractiveToken，未登录时被跳过且无补跑；已启用 `StartWhenAvailable`（错过补跑）。
+- GitHub 匿名 API `core` 配额耗尽时脚本会长时间重试；已让 `_request` 在 403 且 `X-RateLimit-Remaining: 0` 时快速抛错。
+- 无 `GITHUB_TOKEN` 时每周任务不再默认抓 README，避免匿名限速；`run-weekly.bat` 输出重定向到 `data/task-output.log`。
+- 已补生成 2026-08-10 与 2026-08-17 两周归档。

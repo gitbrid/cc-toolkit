@@ -1,2 +1,3 @@
 @echo off
-powershell -NoProfile -ExecutionPolicy Bypass -File "D:\program\CC 工具库\tools\github-trending\run-weekly.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "D:\program\CC 工具库\tools\github-trending\run-weekly.ps1" >> "D:\program\CC 工具库\tools\github-trending\data\task-output.log" 2>&1
+exit /b %ERRORLEVEL%
